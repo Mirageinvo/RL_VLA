@@ -10,8 +10,9 @@ Completed blocks/evals are skipped; crashed blocks resume from the last block
 boundary (uncommitted steps are booked as aborted_*, never reset). Every cached
 artefact is checked against its contract fingerprint before reuse.
 
-Wall-hour ceilings: Stage A <= stage_a_gpu_hours (bank/basis/base-eval included);
-Stage B <= project_gpu_hours - Stage A wall hours (one project budget). The ceiling
+Wall-hour ceilings use the project ledger (walltime.py: every command, incl. separately run
+smoke/eval_base/collect_bank/train_basis and crashed attempts up to their last heartbeat):
+Stage A stops at project total >= stage_a_gpu_hours; Stage B at >= project_gpu_hours. The ceiling
 is also passed into each SAC block as a deadline, so a long block stops early
 (committed cleanly) instead of overrunning; evaluations are not interrupted.
 """
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from flow_residual_rl.budget import StepCounter
 from flow_residual_rl.config import base_parser, load_config, read_json, write_json
 from flow_residual_rl.pipeline import make_provider, make_task, runs_dir, task_dir, task_splits, write_manifest
+from flow_residual_rl.walltime import WallLedger, breakdown
 from flow_residual_rl.stages import build_bank, build_bases, eval_base, eval_cell, log_to, run_cell_block
 
 
@@ -48,7 +50,7 @@ def main():
         tasks, seeds, arms = [cfg["pilot_task_id"]], cfg["training_seeds"][:1], list(cfg["stage_a_arms"])
         final, block = cfg["stage_a_online_final_steps"], cfg["stage_a_block_steps"]
         evals = {int(k): v for k, v in cfg["stage_a_eval_episodes"].items()}
-        gpu_h_limit = cfg["stage_a_gpu_hours"]
+        gpu_h_limit = cfg["stage_a_gpu_hours"]  # project total so far (preparation included)
     else:
         dec = read_json(Path("reports") / "stageA_decision.json", {})
         if dec.get("decision") != "continue" and not a.force:
@@ -56,18 +58,22 @@ def main():
         tasks, seeds, arms = cfg["main_task_ids"], cfg["training_seeds"], list(cfg["stage_b_arms"])
         final, block = cfg["stage_b_online_steps"], cfg["stage_b_block_steps"]
         evals = {int(k): v for k, v in cfg["stage_b_eval_episodes"].items()}
-        stage_a_wall = read_json(runs_dir(cfg) / "stageA_status.json", {}).get("wall_hours", 0.0)
-        gpu_h_limit = cfg["project_gpu_hours"] - stage_a_wall
+        gpu_h_limit = cfg["project_gpu_hours"]  # whole project, Stage A and preparation included
     stage_status_p = root / f"stage{a.stage}_status.json"
-    sst = read_json(stage_status_p, {"wall_hours": 0.0, "done": False})
+    sst = read_json(stage_status_p, {"done": False})
+    ledger = WallLedger(root, f"run_pilot_{a.stage}")
+    wall0 = ledger.project_hours()
+    deadline = time.time() + (gpu_h_limit - wall0) * 3600
+    log(f"[stage {a.stage}] project wall-hour ceiling {gpu_h_limit:.2f} h, already used {wall0:.2f} h "
+        f"{ {k: round(v, 2) for k, v in breakdown(root).items()} }")
+    if wall0 >= gpu_h_limit:
+        log(f"[stop] project wall-hour ceiling {gpu_h_limit:.2f} already reached")
+        return
     prov = make_provider(cfg)
     write_manifest(cfg, root / f"stage{a.stage}_run_manifest.json", prov)
-    t_start, wall0 = time.time(), sst["wall_hours"]
-    deadline = t_start + (gpu_h_limit - wall0) * 3600
-    log(f"[stage {a.stage}] wall-hour ceiling {gpu_h_limit:.2f} h, already used {wall0:.2f} h")
 
     def wall_hours():
-        return wall0 + (time.time() - t_start) / 3600
+        return ledger.project_hours()
 
     def stop(where):
         log(f"[stop] wall-hour ceiling {gpu_h_limit:.2f} reached ({where}); partial report")

@@ -20,6 +20,10 @@ if __name__ == "__main__":
     p.add_argument("--episodes", type=int, default=None)
     a = p.parse_args()
     cfg = load_config(a.config, a.set)
+    from flow_residual_rl.pipeline import runs_dir as _runs_dir
+    from flow_residual_rl.walltime import WallLedger
+
+    _ledger = WallLedger(_runs_dir(cfg), "eval_base")  # project wall-time ledger (runs/wall/)
     counter = StepCounter(task_dir(cfg, a.task_id) / "base_eval" / "cost.json")
     prov = make_provider(cfg, counter)
     task = make_task(cfg, a.task_id, counter, prov)

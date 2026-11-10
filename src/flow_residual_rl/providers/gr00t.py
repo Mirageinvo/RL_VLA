@@ -84,6 +84,11 @@ class Gr00tProvider:
         self.P = None
         if self.projection_path and self.projection_path.exists():
             self.P = np.load(self.projection_path)
+        # backbone_features width = config.backbone_embedding_dim (gr00t_n1d7.py); create P now so the
+        # fingerprint can hash the matrix actually used before the first proposal
+        width = getattr(getattr(model, "config", None), "backbone_embedding_dim", None)
+        if width is not None:
+            self._ensure_projection(int(width))
 
     # ---------------- feature hook ----------------
     def _capture(self, module, inputs, output):
@@ -97,14 +102,23 @@ class Gr00tProvider:
         self._captured = pooled.cpu().numpy().astype(np.float32)
         self._captured_shape = tuple(feats.shape)
 
-    def _project(self, pooled: np.ndarray) -> np.ndarray:
+    def _ensure_projection(self, D: int) -> None:
         if self.P is None:
             rng = np.random.default_rng(self.projection_seed)
-            D = pooled.shape[-1]
             self.P = (rng.standard_normal((D, self.context_dim)) / np.sqrt(self.context_dim)).astype(np.float32)
             if self.projection_path:
                 self.projection_path.parent.mkdir(parents=True, exist_ok=True)
                 np.save(self.projection_path, self.P)
+        assert self.P.shape == (D, self.context_dim), (self.P.shape, D, self.context_dim)
+
+    def projection_digest(self) -> str | None:
+        """sha of the projection matrix in use (None only if the backbone width was unknown at init)."""
+        from ..fingerprint import sha_array
+
+        return sha_array(self.P) if self.P is not None else None
+
+    def _project(self, pooled: np.ndarray) -> np.ndarray:
+        self._ensure_projection(pooled.shape[-1])
         return pooled @ self.P
 
     # ---------------- main API ----------------

@@ -75,19 +75,21 @@ def _cfg(cfg, keys):
 
 
 def checkpoint_hash(cfg) -> str:
-    from .pipeline import _checkpoint_revision
+    """config/statistics files + sha256 of every weight file + backbone HF revisions (not the path)."""
+    from .pipeline import _checkpoint_revision, weights_cache_path
 
-    return sha_obj({k: v for k, v in _checkpoint_revision(cfg["checkpoint_dir"]).items() if k != "path"})
+    rev = _checkpoint_revision(cfg["checkpoint_dir"], weights_cache_path(cfg))
+    return sha_obj({k: v for k, v in rev.items() if k != "path"})
 
 
 def common(cfg, task_id, provider=None, splits=None) -> dict:
-    # the context projection is a deterministic function of (context_projection_seed, backbone width),
-    # both covered by cfg + provider metadata; its file is created lazily, so it is not hashed here.
     fp = {"task_id": task_id, **_cfg(cfg, COMMON_KEYS), **code_hashes(["common"]),
           "checkpoint": checkpoint_hash(cfg)}
     if provider is not None:
         md = provider.metadata()
         fp["provider"] = sha_obj({k: v for k, v in md.items() if k != "hook_shape"})
+        if hasattr(provider, "projection_digest"):  # the projection matrix actually in use
+            fp["context_projection"] = provider.projection_digest()
     if splits is not None:
         fp["splits"] = sha_obj({k: splits[k] for k in ("train", "validation", "evaluation")})
     return fp

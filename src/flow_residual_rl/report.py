@@ -49,7 +49,18 @@ def load_cells(runs: Path):
             evals = {}
             for f in sorted((cdir / "evals").glob("eval_*.json")):
                 d = json.loads(f.read_text())
-                evals[int(d["summary"]["online_steps"])] = d
+                at = int(d["summary"]["online_steps"])
+                prev = evals.get(at)
+                if prev is not None:
+                    # same step: the larger evaluation wins; it must come from the same checkpoint and its
+                    # schedule must extend the smaller one (identical leading episode keys)
+                    small, big = sorted((prev, d), key=lambda x: x["summary"]["n_episodes"])
+                    same_ckpt = small["summary"].get("policy_ckpt") == big["summary"].get("policy_ckpt")
+                    keys_s = [r["key"] for r in small["episodes"]]
+                    prefix = keys_s == [r["key"] for r in big["episodes"]][: len(keys_s)]
+                    assert same_ckpt and prefix, f"{cdir}: inconsistent evals at {at} ({f.name})"
+                    d = big
+                evals[at] = d
             cost = json.loads((cdir / "cost.json").read_text()) if (cdir / "cost.json").exists() else {}
             cells.append({"task_id": tid, "arm": arm, "seed": int(seed), "status": st, "evals": evals, "cost": cost,
                           "train_eps": _jsonl(cdir / "train_episodes.jsonl"), "bank_steps": bank_steps,

@@ -17,6 +17,10 @@ if __name__ == "__main__":
     p.add_argument("--task-id", type=int, required=True)
     a = p.parse_args()
     cfg = load_config(a.config, a.set)
+    from flow_residual_rl.pipeline import runs_dir as _runs_dir
+    from flow_residual_rl.walltime import WallLedger
+
+    _ledger = WallLedger(_runs_dir(cfg), "train_basis")  # project wall-time ledger (runs/wall/)
     r = build_bases(cfg, a.task_id)
     print(json.dumps(r, indent=1, default=float))
     sys.exit(0 if r["status"] == "ok" else 3)

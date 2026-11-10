@@ -157,6 +157,24 @@ class BudgetCallback(BaseCallback):
         return True
 
 
+def truncate_log(path: Path, n_lines: int) -> int:
+    """Keep only the first n_lines committed records of a jsonl log (drop an uncommitted tail). Returns dropped."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    lines = [l for l in path.read_text().splitlines() if l.strip()]
+    if len(lines) <= n_lines:
+        return 0
+    tmp = path.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(l + "\n" for l in lines[:n_lines]))
+    tmp.replace(path)
+    return len(lines) - n_lines
+
+
+def _n_lines(path: Path) -> int:
+    return sum(1 for l in Path(path).read_text().splitlines() if l.strip()) if Path(path).exists() else 0
+
+
 def model_dir(cell_dir: Path, status: dict) -> Path | None:
     """Directory of the committed generation (model.zip, replay.pkl), None for a fresh cell."""
     return Path(cell_dir) / "gens" / status["gen"] if status.get("gen") else None
@@ -172,6 +190,11 @@ def train_block(cell_dir: Path, env, cfg: dict, seed: int, target_steps: int, sm
     if status["online_steps"] >= target_steps:
         return status
     prune_ckpts(ckpt_dir, status["online_steps"])
+    ep_log = cell_dir / "train_episodes.jsonl"
+    n_committed = status.get("episodes_logged", 0 if status["online_steps"] == 0 else None)  # None: legacy status
+    dropped = truncate_log(ep_log, n_committed) if n_committed is not None else 0  # crashed block's episodes
+    if dropped:
+        status.setdefault("dropped_uncommitted_episode_records", []).append(dropped)
     gdir = model_dir(cell_dir, status)
     if gdir is not None:
         model = ResidualSAC.load(gdir / "model.zip", env=env, device=cfg["sac_device"])
@@ -187,7 +210,7 @@ def train_block(cell_dir: Path, env, cfg: dict, seed: int, target_steps: int, sm
     env.schedule.idx = status["episode_idx"]
     model._last_obs = None  # force a real env.reset: never continue from a stale observation
     cb = BudgetCallback(status["online_steps"], target_steps, cfg["policy_checkpoint_every"], ckpt_dir,
-                        cell_dir / "train_episodes.jsonl", deadline=deadline)
+                        ep_log, deadline=deadline)
     t0 = time.time()
     counter = env.task.counter
     try:
@@ -217,7 +240,7 @@ def train_block(cell_dir: Path, env, cfg: dict, seed: int, target_steps: int, sm
                              "replay_added": int(model.replay_buffer.size() - replay0),
                              "rms_mean": float(st[:, 0].mean()), "clip_mean": float(st[:, 1].mean())})
     old_gen = status.get("gen")
-    status.update(online_steps=cb.steps, episode_idx=env.schedule.idx, gen=gen,
+    status.update(online_steps=cb.steps, episode_idx=env.schedule.idx, gen=gen, episodes_logged=_n_lines(ep_log),
                   trainable_params=int(sum(p.numel() for p in model.policy.parameters())))
     counter.save()
     write_json(cell_dir / "status.json", status)  # commit point

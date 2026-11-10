@@ -79,13 +79,65 @@ def write_manifest(cfg, path: Path, provider=None, extra=None):
     if provider is not None:
         e["provider"] = provider.metadata()
         e["frozen_check"] = provider.check_frozen()
-        e["checkpoint_revision"] = _checkpoint_revision(cfg["checkpoint_dir"])
+        e["checkpoint_revision"] = _checkpoint_revision(cfg["checkpoint_dir"], weights_cache_path(cfg))
     write_json(path, collect_manifest(cfg, e))
 
 
-def _checkpoint_revision(ckpt_dir) -> dict:
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+BACKBONE_REPOS = ("nvidia/Cosmos-Reason2-2B",)
+
+
+def _sha256_stream(path: Path, block: int = 1 << 24) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(block), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def weights_identity(ckpt_dir, cache_path: Path | None = None) -> dict:
+    """sha256 of every weight file in the checkpoint dir. Full hashes are computed once and cached by
+    (size, mtime_ns); a replaced/modified file changes size or mtime and is re-hashed."""
+    p = Path(ckpt_dir)
+    cache = read_json(cache_path, {}) if cache_path else {}
+    out, changed = {}, False
+    for f in sorted(q for q in p.rglob("*") if q.is_file() and q.suffix in WEIGHT_SUFFIXES and ".cache" not in q.parts):
+        st = f.stat()
+        key = str(f.resolve())
+        c = cache.get(key)
+        if not c or c["size"] != st.st_size or c["mtime_ns"] != st.st_mtime_ns:
+            c = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": _sha256_stream(f)}
+            cache[key], changed = c, True
+        out[str(f.relative_to(p))] = c["sha256"]
+    if cache_path and changed:
+        write_json(cache_path, cache)
+    return out
+
+
+def _hf_hub_cache() -> Path:
+    import os
+
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+
+
+def backbone_revisions() -> dict:
+    """Commit of the HF backbone snapshots GR00T fetches at construction (refs/main of the hub cache)."""
+    out = {}
+    for repo in BACKBONE_REPOS:
+        ref = _hf_hub_cache() / ("models--" + repo.replace("/", "--")) / "refs" / "main"
+        out[repo] = ref.read_text().strip() if ref.exists() else None
+    return out
+
+
+def _checkpoint_revision(ckpt_dir, cache_path: Path | None = None) -> dict:
     p = Path(ckpt_dir)
     out = {"path": str(p.resolve()) if p.exists() else str(p)}
+    out["weights_sha256"] = weights_identity(p, cache_path) if p.exists() else {}
+    out["backbone_revisions"] = backbone_revisions()
     for f in ["config.json", "model.safetensors.index.json", "processor_config.json", "statistics.json"]:
         q = p / f
         if q.exists():
@@ -97,6 +149,10 @@ def _checkpoint_revision(ckpt_dir) -> dict:
     if meta:
         out["hf_commit"] = meta[0].read_text().splitlines()[0]
     return out
+
+
+def weights_cache_path(cfg) -> Path:
+    return runs_dir(cfg) / "shared" / "weights_sha256_cache.json"
 
 
 def counter_for(path: Path) -> StepCounter:

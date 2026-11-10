@@ -211,6 +211,73 @@ def test_crashed_block_is_booked_as_aborted(tmp_path, monkeypatch):
     st = run_cell_block(cfg, task, prov, "dct12", 61, 400, sp, log)
     cost = json.loads((cdir / "cost.json").read_text())["steps"]
     assert cost["aborted_online"] == spent - 200 and cost["online_train"] == st["online_steps"]
+    # the crashed block's episode records were dropped: no episode appears twice in the training curve
+    recs = [json.loads(l) for l in (cdir / "train_episodes.jsonl").read_text().splitlines() if l.strip()]
+    keys = [r["key"] for r in recs]
+    assert len(keys) == len(set(keys)) and st["dropped_uncommitted_episode_records"][0] >= 1
+    assert st["episodes_logged"] == len(recs) and max(r["online_steps_end"] for r in recs) <= st["online_steps"]
+
+
+def test_report_prefers_larger_eval_at_same_step(tmp_path):
+    from flow_residual_rl.report import load_cells
+
+    cdir = tmp_path / "libero_10_task0" / "cells" / "outcome12_seed61"
+    (cdir / "evals").mkdir(parents=True)
+    for n in (50, 100):
+        eps = [{"episode": e, "key": f"eval/0/{e}", "success": True, "init_state_id": 0} for e in range(n)]
+        write_json(cdir / "evals" / f"eval_0060000_n{n}.json",
+                   {"summary": {"online_steps": 60000, "n_episodes": n, "policy_ckpt": "p.pt"}, "episodes": eps})
+    (c,) = load_cells(tmp_path)
+    assert c["evals"][60000]["summary"]["n_episodes"] == 100
+
+
+def test_weights_identity_detects_replaced_weights(tmp_path):
+    import os
+
+    from flow_residual_rl.pipeline import weights_identity
+
+    ck = tmp_path / "ckpt"
+    ck.mkdir()
+    (ck / "model.safetensors").write_bytes(b"a" * 1000)
+    cache = tmp_path / "cache.json"
+    h1 = weights_identity(ck, cache)
+    assert weights_identity(ck, cache) == h1  # cached
+    (ck / "model.safetensors").write_bytes(b"b" * 1000)  # same size
+    os.utime(ck / "model.safetensors", ns=(1, 1))
+    assert weights_identity(ck, cache) != h1
+
+
+def test_fingerprint_covers_weights_and_projection(tmp_path):
+    from flow_residual_rl import fingerprint as fpr
+
+    ck = tmp_path / "ckpt"
+    ck.mkdir()
+    (ck / "model.safetensors").write_bytes(b"a" * 10)
+    cfg = pilot_cfg(tmp_path, checkpoint_dir=str(ck))
+
+    class P(FakeProvider):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def projection_digest(self):
+            return fpr.sha_array(np.full((4, 2), self.m, np.float32))
+
+    f1 = fpr.common(cfg, 0, P(1.0))
+    assert fpr.common(cfg, 0, P(2.0))["context_projection"] != f1["context_projection"]
+    (ck / "model.safetensors").write_bytes(b"bbbbbbbbbbbb")
+    assert fpr.common(cfg, 0, P(1.0))["checkpoint"] != f1["checkpoint"]
+
+
+def test_project_wall_ledger_counts_all_commands(tmp_path):
+    from flow_residual_rl.walltime import WallLedger, project_hours
+
+    write_json(tmp_path / "wall" / "collect_bank_1_1.json",  # a crashed earlier command: counted to its last beat
+               {"command": "collect_bank", "pid": 1, "start": 0.0, "last": 7200.0, "finished": False})
+    led = WallLedger(tmp_path, "run_pilot_A", heartbeat_s=3600)
+    h = led.project_hours()
+    led.close()
+    assert 2.0 <= h < 2.01 and 2.0 <= project_hours(tmp_path) < 2.01
 
 
 # ---------------------------------------------------------------- 6. Stage-A decision

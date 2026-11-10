@@ -177,7 +177,7 @@ def check3(cfg, task, prov, sp):
     res["pass"] = bool(all_ok)
     res["recommendation"] = (f"restore_mode={mode} verified" if all_ok else
                              f"restore_mode={mode} FAILED: inspect anchors; "
-                             + ("try --set restore_mode=replay and re-run --only 1 3" if mode == "snapshot"
+                             + ("re-run the FULL smoke with --set restore_mode=replay (the fingerprint covers restore_mode, so all checks must pass under it)" if mode == "snapshot"
                                 else "replay is not deterministic either: stop, do not collect the bank"))
     return res
 
@@ -268,6 +268,10 @@ def main():
     p.add_argument("--force", action="store_true")
     a = p.parse_args()
     cfg = load_config(a.config, a.set)
+    from flow_residual_rl.pipeline import runs_dir as _runs_dir
+    from flow_residual_rl.walltime import WallLedger
+
+    _ledger = WallLedger(_runs_dir(cfg), "smoke")  # project wall-time ledger (runs/wall/)
     tid = cfg["pilot_task_id"] if a.task_id is None else a.task_id
     out = runs_dir(cfg) / "smoke"
     out.mkdir(parents=True, exist_ok=True)

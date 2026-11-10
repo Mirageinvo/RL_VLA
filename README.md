@@ -5,7 +5,7 @@ outputs `u ∈ [-1,1]^d`, mapped through a fixed basis `B ∈ R^{48×d}` to a bo
 (`RMS ≤ ε = 0.10` for every rank). Arms: `outcome12` (B learned from paired-intervention outcomes),
 `random12`, `dct12`, `pca12`, `full48`. Full spec: the agent plan (sec. 1–20).
 
-**Status:** implemented; contract tested on CPU with fakes only (`pytest`, 31 tests + 1 that needs LIBERO and runs only in the container).
+**Status:** implemented; contract tested on CPU with fakes only (`pytest`, 35 tests + 1 that needs LIBERO and runs only in the container).
 **Nothing has run on the simulator or with GR00T yet**; the first real result is `scripts/smoke.py` on the cluster.
 
 ## Cluster setup (V100, Docker)
@@ -41,8 +41,9 @@ Use `PYTHONPATH=src` or `pip install -e .` for `python -m flow_residual_rl.repor
 
 Smoke results → `runs/smoke/smoke_report.json` (`overall_pass`); **the script exits 1 if any check fails**,
 so chain it: `python scripts/smoke.py ... && python scripts/eval_base.py ...`. If check 3 (restore) fails,
-inspect the anchors, then rerun with `--set restore_mode=replay --only 1 3` (checks 1 and 3 then go through
-prefix replay, the same `restore.restore_to` path the bank uses) — do not loosen `restore_atol/rtol`.
+inspect the anchors, then rerun the **full** smoke with `--set restore_mode=replay` (no `--only`: the
+fingerprint covers `restore_mode`, so every check must pass under it; checks 1 and 3 then go through prefix
+replay, the same `restore.restore_to` path the bank uses) — do not loosen `restore_atol/rtol`.
 Put the verified `restore_mode` into `configs/pilot.yaml` **before** collecting the bank.
 
 Safety rails (bf3fe64 review):
@@ -57,6 +58,17 @@ Safety rails (bf3fe64 review):
   (`gens/gen_<steps>`), evals load the policy checkpoint taken when the cell first crossed the eval step.
 * the bank drops groups whose zero branch does not reproduce the pool continuation and aborts after
   `bank_max_restore_failures` such groups.
+* the checkpoint part of the fingerprint includes the sha256 of every weight file (computed once, cached in
+  `runs/shared/weights_sha256_cache.json` by size+mtime; the first launch hashes the full checkpoint), the HF
+  revision of the backbone snapshot (`nvidia/Cosmos-Reason2-2B`, from the hub cache) and the hash of the
+  context-projection matrix actually in use.
+* training-episode records of a crashed block are cut back to the committed position (`episodes_logged`
+  in `status.json`), so the training curve never counts an episode twice.
+* if several evals exist at one step (e.g. n50 and later n100), the report uses the largest one (same
+  checkpoint, schedule extending the smaller one).
+* wall time is one project ledger (`runs/wall/`, one file per command, heartbeat every 60 s): smoke,
+  eval_base, collect_bank, train_basis and run_pilot all count; a killed command counts up to its last
+  heartbeat. Stage A stops at `stage_a_gpu_hours` of project time, Stage B at `project_gpu_hours`.
 * the Stage-A report returns `partial` (and Stage B will not start) unless all `stage_a_arms` have the
   endpoint eval with the required episode count on the same schedule.
 
