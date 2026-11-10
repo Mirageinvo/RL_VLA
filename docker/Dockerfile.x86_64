@@ -1,0 +1,62 @@
+# RL_VLA image: frozen GR00T N1.7 + LIBERO + SB3 in ONE Python 3.12 env, built for V100 (sm_70).
+#
+# * torch 2.9.0 from the cu126 index: the cu128/cu130 wheels no longer ship sm_70 kernels.
+# * NO flash-attn: its kernels need sm_80+. Qwen3 backbone falls back to SDPA when
+#   `import flash_attn` fails (gr00t/model/modules/qwen3_backbone.py).
+# * GR00T / LIBERO are pinned to the SHAs whose sources this project was written against.
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+    VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH \
+    LIBERO_CONFIG_PATH=/opt/libero_config \
+    UV_HTTP_TIMEOUT=300
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      sudo git git-lfs curl wget ca-certificates nano tmux htop build-essential cmake \
+      python3.12 python3.12-venv python3.12-dev ffmpeg \
+      libgl1 libglew-dev libegl1 libgles2 libosmesa6-dev libglfw3 patchelf libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh && \
+    uv venv /opt/venv --python /usr/bin/python3.12
+
+RUN uv pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu126
+
+ARG GR00T_SHA=1e50c01631e5f0d816b6fb2d8ee40ce11f7362af
+ARG LIBERO_SHA=8f1084e3132a39270c3a13ebe37270a43ece2a01
+RUN GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/NVIDIA/Isaac-GR00T.git /opt/Isaac-GR00T && \
+    cd /opt/Isaac-GR00T && git checkout ${GR00T_SHA} && \
+    git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git /opt/LIBERO && \
+    cd /opt/LIBERO && git checkout ${LIBERO_SHA}
+
+# GR00T runtime deps (pyproject list minus flash-attn / deepspeed / tensorrt / onnx: not needed for inference here)
+RUN uv pip install \
+      albumentations==1.4.18 "huggingface-hub[cli]" "opencv-python-headless>=4.5,<4.13" diffusers==0.35.1 dm-tree \
+      lmdb==1.7.5 msgpack==1.1.0 msgpack-numpy==0.4.8 pandas==2.2.3 peft==0.17.1 termcolor==3.2.0 \
+      transformers==4.57.3 tyro==0.9.17 click==8.1.8 datasets==3.6.0 einops==0.8.1 gitpython==3.1.50 \
+      jsonlines==4.0.0 gymnasium==1.2.2 matplotlib==3.10.1 numpy==1.26.4 omegaconf==2.3.0 scipy==1.15.3 \
+      torchcodec==0.8.0 pyzmq==27.0.1 accelerate && \
+    uv pip install --no-deps -e /opt/Isaac-GR00T
+
+# LIBERO sim stack (pins as in gr00t/eval/sim/LIBERO/setup_libero.sh; mujoco<3.10 for robosuite 1.4 mj_fullM)
+RUN uv pip install robosuite==1.4.0 bddl==1.0.1 easydict==1.9 future cloudpickle gym==0.25.2 hydra-core==1.3.2 \
+      mujoco==3.3.1 numpy==1.26.4 imageio imageio-ffmpeg && \
+    uv pip install --no-deps -e /opt/LIBERO --config-settings editable_mode=compat && \
+    mkdir -p /opt/libero_config && printf 'n\n' | python -c "import libero.libero" && \
+    python -c "from libero.libero import benchmark; print(benchmark.get_benchmark_dict()['libero_10']().get_task_names()[:2])"
+
+# RL side
+RUN uv pip install "stable-baselines3==2.7.0" pyyaml pytest
+
+ARG USER=docker_user
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} ${USER} || true && \
+    useradd -m -u ${UID} -g ${GID} ${USER} || true && \
+    echo "${USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER} && chmod 0440 /etc/sudoers.d/${USER} && \
+    chown -R ${UID}:${GID} /opt/libero_config
+WORKDIR /tmp
+USER ${UID}:${GID}
+CMD ["/bin/bash"]

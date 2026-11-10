@@ -1,0 +1,83 @@
+# Pilot config (plan sec. 17). Values marked "from recipe" were read from the
+# Isaac-GR00T LIBERO evaluation path (gr00t/eval/rollout_policy.py,
+# examples/LIBERO/README.md) and are written into the resolved config at run time.
+
+base_model: gr00t_n1d7
+checkpoint_repo: nvidia/GR00T-N1.7-LIBERO
+checkpoint_subdir: libero_10
+checkpoint_dir: checkpoints/GR00T-N1.7-LIBERO/libero_10   # local download dir
+embodiment_tag: LIBERO_PANDA
+# V100 has no native bf16. "auto": bf16 if natively supported, else float32.
+# Must be identical for every arm; recorded in the manifest.
+model_dtype: auto
+device: cuda:0
+
+suite: libero_10
+pilot_task_id: 0
+main_task_ids: [0, 3, 8]
+training_seeds: [61, 97]
+split_seed: 61
+split_fractions: [0.6, 0.2, 0.2]       # train / validation / evaluation over init-state ids
+
+execution_horizon: 8                   # C, from recipe (--n-action-steps 8)
+episode_cap: 720                       # from recipe (DEFAULT_MAX_EPISODE_STEPS=720, --max-episode-steps 720)
+settle_steps: 0                        # GR00T path does no settling; dummy steps would be charged to *_settling
+camera_size: 256                       # from recipe (LiberoEnv camera_heights/widths)
+
+rank: 12
+corrected_dims: [0, 1, 2, 3, 4, 5]
+epsilon_rms: 0.10
+context_dim: 128
+context_projection_seed: 20261109
+random_basis_seed: 1234
+
+bank_budget_steps: 30000
+bank_max_steps_with_rescue: 50000
+bank_anchor_target: 64
+bank_pool_max_steps: 4000
+bank_branch_horizon: 96
+bank_val_every: 4                      # every 4th pool episode is rolled out from a validation init state
+bank_seed: 7
+restore_mode: snapshot                 # snapshot | replay (set by restore check)
+
+basis_train_updates: 2000
+basis_lr: 0.001
+basis_weight_decay: 0.001
+basis_pair_weight: 1.0
+basis_batch_groups: 16
+basis_hidden: [64, 64]
+basis_eval_every: 100
+basis_min_discordant_train: 16
+basis_min_discordant_val: 4
+
+sac_hidden: [256, 256]
+sac_batch_size: 256
+sac_lr: 0.0003
+sac_buffer_size: 100000
+sac_learning_starts_chunks: 256
+sac_train_freq_chunks: 1
+sac_gradient_steps: 1
+sac_gamma_chunk: 0.99
+sac_tau: 0.005
+sac_ent_coef: auto_0.01
+sac_log_std_bias_init: -3.0
+sac_device: cpu
+warmup_radius: [0.25, 1.0]
+
+stage_a_online_first_steps: 20000
+stage_a_online_final_steps: 60000
+stage_a_block_steps: 20000
+stage_a_eval_episodes: {20000: 25, 60000: 50}
+stage_b_online_steps: 100000
+stage_b_block_steps: 20000
+stage_b_eval_episodes: {50000: 25, 100000: 100}
+policy_checkpoint_every: 10000
+baseline_eval_episodes: 25
+stage_a_arms: [outcome12, random12, dct12, full48]
+stage_b_arms: [outcome12, random12, dct12, pca12, full48]
+
+smoke_env_step_limit: 1500
+smoke_sac_learning_starts: 4
+smoke_sac_batch_size: 8
+
+runs_dir: runs
