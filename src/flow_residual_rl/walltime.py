@@ -54,24 +54,34 @@ class WallLedger:
         self.path = ledger_dir(runs_dir) / f"{command}_{int(self.start)}_{os.getpid()}.json"
         self.runs_dir, self.heartbeat_s = runs_dir, heartbeat_s
         self._stop = threading.Event()
+        self._lock = threading.Lock()  # beat() runs from the heartbeat thread and the main thread
+        self._closed = False
         self.beat()
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
         atexit.register(self.close)
 
     def beat(self, finished: bool = False) -> None:
-        self.rec["last"] = time.time()
-        self.rec["finished"] = finished
-        atomic_write_json(self.path, self.rec)
+        with self._lock:  # one writer at a time: the tmp file name (pid-based) is shared by both threads
+            if self._closed and not finished:
+                return  # never overwrite the final record
+            self.rec["last"] = time.time()
+            self.rec["finished"] = finished
+            atomic_write_json(self.path, self.rec)
 
     def _loop(self):
         while not self._stop.wait(self.heartbeat_s):
             self.beat()
 
     def close(self):
-        if not self._stop.is_set():
-            self._stop.set()
-            self.beat(finished=True)
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        if self._t is not threading.current_thread():
+            self._t.join()  # outside the lock: the thread may be inside beat()
+        self.beat(finished=True)
+        with self._lock:
+            self._closed = True
 
     def project_hours(self) -> float:
         self.beat()

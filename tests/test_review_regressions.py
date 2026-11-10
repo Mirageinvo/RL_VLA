@@ -300,3 +300,37 @@ def test_stage_a_decision_requires_all_arms():
     assert d["decision"] == "continue"
     short = [_cell(a, s, n=(25 if a == "dct12" else 50)) for a, s in zip(req, (0.7, 0.5, 0.5, 0.5))]
     assert decide(short, 0, 61, 60000, req, 50)["decision"] == "partial"
+
+
+def test_wall_ledger_concurrent_beats(tmp_path, monkeypatch):
+    """Two threads beating at once used to race on the shared tmp file (FileNotFoundError)."""
+    import threading
+    import time as _t
+
+    from flow_residual_rl import walltime
+
+    real = walltime.atomic_write_json
+
+    def slow_write(path, obj):  # widen the window between tmp write and os.replace
+        _t.sleep(0.01)
+        real(path, obj)
+
+    monkeypatch.setattr(walltime, "atomic_write_json", slow_write)
+    led = walltime.WallLedger(tmp_path, "x", heartbeat_s=0.001)
+    errors = []
+
+    def hammer():
+        try:
+            for _ in range(20):
+                led.beat()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=hammer) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    led.close()
+    assert not errors and json.loads(led.path.read_text())["finished"] is True
+    assert led._t.is_alive() is False
