@@ -12,6 +12,8 @@ from flow_residual_rl.providers.gr00t import Proposal, model_to_env
 
 
 class FakeTask:
+    """restore_bias != 0 simulates a *repeatable* but wrong snapshot restore (state shifted)."""
+
     ACTION_LOW = -np.ones(7, np.float32)
     ACTION_HIGH = np.ones(7, np.float32)
 
@@ -21,6 +23,8 @@ class FakeTask:
         self.n_init_states = 10
         self.elapsed, self.success, self.pos, self.init_state_id = 0, False, np.zeros(3), -1
         self.prefix = []
+        self.restore_bias = 0.0
+        self.n_restore = self.n_replay = 0
 
     def reset(self, sid, settle_bucket=None):
         self.init_state_id, self.elapsed, self.success, self.prefix = sid, 0, False, []
@@ -50,10 +54,13 @@ class FakeTask:
                                init_state_id=self.init_state_id, action_prefix=np.array(self.prefix, np.float32))
 
     def restore(self, s):
+        self.n_restore += 1
         self.pos, self.elapsed, self.success, self.init_state_id = s.sim_flat.copy(), s.elapsed, s.success, s.init_state_id
         self.prefix = list(s.action_prefix)
+        self.pos = self.pos + self.restore_bias
 
     def replay_restore(self, s, bucket="bank_prefix_replay"):
+        self.n_replay += 1
         with self.counter.charge(bucket):
             self.reset(s.init_state_id)
             for a in s.action_prefix:
@@ -74,6 +81,9 @@ class FakeProvider:
         self.chunk, self.context_dim, self.drift = chunk, context_dim, drift
         self.counter = None
         self.calls = 0
+
+    def metadata(self):
+        return {"C": self.chunk, "fake": True}
 
     def propose(self, observation, task, proposal_seed):
         self.calls += 1

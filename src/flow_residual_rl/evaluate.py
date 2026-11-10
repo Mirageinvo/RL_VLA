@@ -31,12 +31,14 @@ def run_episodes(env: ChunkEnv, policy_fn, n_episodes: int, out_path: Path | Non
             u = policy_fn(obs)
             obs, r, term, trunc, info = env.step(u)
             if frames is not None:
-                frames.append(env.task.policy_observation()["video"]["image"][0, -1])
+                po = env.task.policy_observation()
+                if "video" in po:  # real LIBERO task (CPU test fakes have no camera)
+                    frames.append(po["video"]["image"][0, -1])
             if term or trunc:
                 break
         rec = dict(info["episode_record"], episode=e, wall_s=time.time() - t0)
         recs.append(rec)
-        if frames is not None:
+        if frames:
             _save_video(frames, Path(video_dir) / f"ep{e:03d}_s{rec['init_state_id']}_{'ok' if rec['success'] else 'fail'}.mp4")
     sr = float(np.mean([r["success"] for r in recs])) if recs else float("nan")
     summary = {"n_episodes": len(recs), "success_rate": sr,

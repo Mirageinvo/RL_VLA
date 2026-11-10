@@ -7,9 +7,14 @@ Stage B: tasks main_task_ids x seeds training_seeds x arms stage_b_arms to
          stage_b_online_steps; Stage A cells are continued, not restarted.
          Requires reports/stageA_decision.json == continue (or --force).
 Completed blocks/evals are skipped; crashed blocks resume from the last block
-boundary (uncommitted steps are booked as aborted, never reset).
+boundary (uncommitted steps are booked as aborted_*, never reset). Every cached
+artefact is checked against its contract fingerprint before reuse.
+
+Wall-hour ceilings: Stage A <= stage_a_gpu_hours (bank/basis/base-eval included);
+Stage B <= project_gpu_hours - Stage A wall hours (one project budget). The ceiling
+is also passed into each SAC block as a deadline, so a long block stops early
+(committed cleanly) instead of overrunning; evaluations are not interrupted.
 """
-import json
 import sys
 import time
 from pathlib import Path
@@ -19,14 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from flow_residual_rl.budget import StepCounter
 from flow_residual_rl.config import base_parser, load_config, read_json, write_json
 from flow_residual_rl.pipeline import make_provider, make_task, runs_dir, task_dir, task_splits, write_manifest
-from flow_residual_rl.stages import build_bank, build_bases, cell_dir, eval_base, eval_cell, log_to, run_cell_block
+from flow_residual_rl.stages import build_bank, build_bases, eval_base, eval_cell, log_to, run_cell_block
 
 
 def ensure_task_ready(cfg, tid, prov, log):
     meta = build_bank(cfg, tid, prov)
-    st = read_json(task_dir(cfg, tid) / "basis" / "outcome12_status.json")
-    if st is None or not (task_dir(cfg, tid) / "basis" / "pca12" / "basis.npy").exists():
-        st = build_bases(cfg, tid)
+    st = build_bases(cfg, tid, reuse=True)  # reuses a finished basis only if its fingerprint matches
     log(f"[task {tid}] bank groups={meta['n_groups']} disc(train/val)={meta['n_discordant_train']}/"
         f"{meta['n_discordant_val']} basis={st['status']}")
     return st["status"] == "ok"
@@ -45,7 +48,7 @@ def main():
         tasks, seeds, arms = [cfg["pilot_task_id"]], cfg["training_seeds"][:1], list(cfg["stage_a_arms"])
         final, block = cfg["stage_a_online_final_steps"], cfg["stage_a_block_steps"]
         evals = {int(k): v for k, v in cfg["stage_a_eval_episodes"].items()}
-        gpu_h_limit = cfg.get("stage_a_gpu_hours", 24)
+        gpu_h_limit = cfg["stage_a_gpu_hours"]
     else:
         dec = read_json(Path("reports") / "stageA_decision.json", {})
         if dec.get("decision") != "continue" and not a.force:
@@ -53,15 +56,22 @@ def main():
         tasks, seeds, arms = cfg["main_task_ids"], cfg["training_seeds"], list(cfg["stage_b_arms"])
         final, block = cfg["stage_b_online_steps"], cfg["stage_b_block_steps"]
         evals = {int(k): v for k, v in cfg["stage_b_eval_episodes"].items()}
-        gpu_h_limit = cfg.get("project_gpu_hours", 96)
+        stage_a_wall = read_json(runs_dir(cfg) / "stageA_status.json", {}).get("wall_hours", 0.0)
+        gpu_h_limit = cfg["project_gpu_hours"] - stage_a_wall
     stage_status_p = root / f"stage{a.stage}_status.json"
     sst = read_json(stage_status_p, {"wall_hours": 0.0, "done": False})
     prov = make_provider(cfg)
     write_manifest(cfg, root / f"stage{a.stage}_run_manifest.json", prov)
     t_start, wall0 = time.time(), sst["wall_hours"]
+    deadline = t_start + (gpu_h_limit - wall0) * 3600
+    log(f"[stage {a.stage}] wall-hour ceiling {gpu_h_limit:.2f} h, already used {wall0:.2f} h")
 
     def wall_hours():
         return wall0 + (time.time() - t_start) / 3600
+
+    def stop(where):
+        log(f"[stop] wall-hour ceiling {gpu_h_limit:.2f} reached ({where}); partial report")
+        write_json(stage_status_p, dict(sst, wall_hours=wall_hours(), stopped_at=where))
 
     ready = {tid: ensure_task_ready(cfg, tid, prov, log) for tid in tasks}
     task_objs, sps = {}, {}
@@ -76,23 +86,21 @@ def main():
     targets = list(range(block, final + 1, block))
     if targets[-1] != final:
         targets.append(final)
+    bad = [at for at in evals if at not in targets and at % cfg["policy_checkpoint_every"]]
+    assert not bad, f"eval points {bad} are neither block targets nor multiples of policy_checkpoint_every"
     for target in targets:
         for tid in tasks:
             arms_t = [x for x in arms if ready[tid] or x != "outcome12"]
             for seed in seeds:
                 for arm in arms_t:
                     if wall_hours() > gpu_h_limit:
-                        log(f"[stop] wall-hour ceiling {gpu_h_limit} reached at block {target}; partial report")
-                        write_json(stage_status_p, dict(sst, wall_hours=wall_hours(), stopped_at=target))
-                        return
-                    st = run_cell_block(cfg, task_objs[tid], prov, arm, seed, target, sps[tid], log)
-                    prev = target - block
+                        return stop(f"before block {target}")
+                    st = run_cell_block(cfg, task_objs[tid], prov, arm, seed, target, sps[tid], log, deadline=deadline)
                     for at, n in sorted(evals.items()):
-                        if prev < at <= target:
-                            ck = None
-                            if at != target:
-                                ck = cell_dir(cfg, tid, arm, seed) / "policy_ckpts" / f"policy_{at:07d}.pt"
-                            eval_cell(cfg, task_objs[tid], prov, arm, seed, n, at, sps[tid], log, policy_ckpt=ck)
+                        if at <= st["online_steps"]:  # eval_cell skips evals that are already committed
+                            eval_cell(cfg, task_objs[tid], prov, arm, seed, n, at, sps[tid], log)
+                    if st["online_steps"] < target:
+                        return stop(f"inside block {target}, {arm} s{seed} at {st['online_steps']}")
                     write_json(stage_status_p, dict(sst, wall_hours=wall_hours(), last=[target, tid, seed, arm]))
         log(f"[block] all cells reached {target} online env steps; wall {wall_hours():.2f} h")
     write_json(stage_status_p, dict(sst, wall_hours=wall_hours(), done=True))

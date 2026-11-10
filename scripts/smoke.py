@@ -8,15 +8,20 @@ Passed checks are not re-run unless --force (or --only <n>).
      arm; ChunkEnv(u=0) == direct execution of the provider's a0 from the same
      snapshot with the same base noise; episode boundary at the benchmark horizon.
   2. Bases: shape/dtype, B^T B = I, common RMS bound for random/DCT/full (+ outcome/pca if present).
-  3. Restore: on 5 anchors, restore -> same fragment, same noise -> restore -> repeat;
-     continuous state atol=1e-5 / rtol=1e-4, identical success/timestep.
+  3. Restore (with the configured restore_mode -- the same restore.restore_to path the bank uses):
+     on 5 anchors, restore -> same fragment, same noise -> restore -> repeat; both repeats AND the
+     original continuation must agree: sim state, proprio, a0 element-wise within restore_atol +
+     restore_rtol*|ref|, identical success/timestep.
   4. Frozen: GR00T has 0 trainable params, none in SAC optimizers; actor/critic get finite grads.
   5. End-to-end SAC smoke: reward/terminal handling, save/load, step counters.
+
+Every check reports one boolean `pass` (check4_5: pass4 AND pass5). A cached check is
+skipped only if it passed under the same contract fingerprint (config + code).
+The script writes `overall_pass` and exits with code 1 unless every mandatory check passed.
 """
 from __future__ import annotations
 
 import sys
-import tempfile
 import traceback
 from pathlib import Path
 
@@ -24,21 +29,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
 
-from flow_residual_rl.basis import ARM_NAMES, ResidualMap, check_orthonormal
+from flow_residual_rl.basis import ARM_NAMES, check_orthonormal
 from flow_residual_rl.budget import BudgetExceeded, StepCounter
 from flow_residual_rl.config import base_parser, derive_seed, load_config, read_json, write_json
 from flow_residual_rl.envs.chunk_env import ChunkEnv, EpisodeSchedule, ObsNormalizer
 from flow_residual_rl.pipeline import (basis_for_arm, make_provider, make_task, obs_dim, residual_map, runs_dir,
                                        task_splits, write_manifest)
+from flow_residual_rl.restore import compare, restore_to, tolerances
 
-ATOL, RTOL = 1e-5, 1e-4
+MANDATORY = ("check1", "check2", "check3", "check4_5")
+SMOKE_REPLAY_BUCKET = "smoke"
 
 
-def close(a, b):
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    err = np.abs(a - b)
-    ok = bool(np.all(err <= ATOL + RTOL * np.abs(b)))
-    return ok, float(err.max()) if err.size else 0.0
+def check_passed(res: dict | None) -> bool:
+    """The single verdict of one check (check4_5 needs both parts)."""
+    if not isinstance(res, dict):
+        return False
+    if "pass4" in res or "pass5" in res:
+        return bool(res.get("pass4")) and bool(res.get("pass5")) and res.get("pass", True) is not False
+    return res.get("pass") is True
+
+
+def summarize(report: dict, fingerprint_digest: str | None = None) -> dict:
+    per = {k: check_passed(report.get(k)) for k in MANDATORY}
+    stale = [k for k in MANDATORY if fingerprint_digest is not None and isinstance(report.get(k), dict)
+             and report[k].get("fingerprint") != fingerprint_digest]
+    return {"checks": per, "stale_fingerprint": stale,
+            "overall_pass": all(per.values()) and not stale}
 
 
 def available_bases(cfg, task_id):
@@ -81,16 +98,16 @@ def check1(cfg, task, prov, sp):
     s0 = task.snapshot()
     env.step(np.zeros(rm.dim, np.float32))
     s_env = task.state_vector()
-    task.restore(s0)
+    restore_to(task, s0, cfg["restore_mode"], SMOKE_REPLAY_BUCKET)
     for t in range(cfg["execution_horizon"]):
         task.step(a0_env[t])
-    ok, err = close(task.state_vector(), s_env)
-    res["chunkenv_u0_equals_direct"] = ok
-    res["chunkenv_u0_maxerr"] = err
+    c = compare(task.state_vector(), s_env, *tolerances(cfg))
+    res["chunkenv_u0_equals_direct"] = c["ok"]
+    res["chunkenv_u0_maxerr"] = c["max_abs_err"]
     seed_expected = derive_seed("base", "smoke/u0", 0)
     res["chunkenv_seed_matches_schedule"] = bool(env.proposal is not None and seed_expected != 0)
     # episode boundary: put the episode 1 chunk before the horizon and step once
-    task.restore(s0)
+    restore_to(task, s0, cfg["restore_mode"], SMOKE_REPLAY_BUCKET)
     task.elapsed = cfg["episode_cap"] - cfg["execution_horizon"]
     env.proposal = prov.propose(task.policy_observation(), None, 5)
     _, r, term, trunc, info = env.step(np.zeros(rm.dim, np.float32))
@@ -119,42 +136,49 @@ def check2(cfg, task):
 
 
 def check3(cfg, task, prov, sp):
-    C = cfg["execution_horizon"]
+    """Restore validity with the configured restore_mode. pass requires, on every anchor:
+    repeat 1 == repeat 2 == the ORIGINAL continuation (sim state, proprio, a0; element-wise
+    atol + rtol*|ref|) and identical success flag / timestep."""
+    C, mode = cfg["execution_horizon"], cfg["restore_mode"]
+    atol, rtol = tolerances(cfg)
     task.reset(sp["train"][1 % len(sp["train"])], settle_bucket="smoke")
-    snaps = []
+    snaps, orig = [], []
     for k in range(6):
-        snaps.append((task.snapshot(), derive_seed("restore", k)))
-        p = prov.propose(task.policy_observation(), None, snaps[-1][1])
-        for t in range(C):
-            task.step(p.a0_env[t])
-    res, all_ok = {"anchors": []}, True
-    for snap, seed in snaps[1:]:  # 5 anchors
-        outs = []
-        for rep in range(2):
-            task.restore(snap)
-            p = prov.propose(task.policy_observation(), None, seed)
-            for t in range(C):
-                task.step(p.a0_env[t])
-            outs.append((task.state_vector(), task.proprio(), task.success, task.elapsed, p.a0_env))
-        ok_s, e_s = close(outs[0][0], outs[1][0])
-        ok_p, e_p = close(outs[0][1], outs[1][1])
-        ok_a, e_a = close(outs[0][4], outs[1][4])
-        disc = outs[0][2] == outs[1][2] and outs[0][3] == outs[1][3]
-        all_ok &= ok_s and ok_p and disc
-        res["anchors"].append({"elapsed": snap.elapsed, "state_err": e_s, "proprio_err": e_p, "a0_err": e_a,
-                               "discrete_equal": bool(disc), "ok": bool(ok_s and ok_p and disc)})
-    # also: restored zero-branch vs the original continuation (snapshot k -> state at k+1)
-    errs = []
-    for (snap, seed), (nxt, _) in zip(snaps[:-1], snaps[1:]):
-        task.restore(snap)
+        seed = derive_seed("restore", k)
+        snaps.append((task.snapshot(), seed))
         p = prov.propose(task.policy_observation(), None, seed)
         for t in range(C):
             task.step(p.a0_env[t])
-        errs.append(close(task.state_vector(), nxt.sim_flat)[1])
-    res["vs_original_continuation_maxerr"] = max(errs)
-    res["vs_original_ok"] = bool(max(errs) <= ATOL)
+        orig.append((task.state_vector(), task.proprio(), bool(task.success), int(task.elapsed), p.a0_env.copy()))
+    n_replay0 = task.counter.steps["smoke"]
+    res = {"restore_mode": mode, "atol": atol, "rtol": rtol, "anchors": []}
+    all_ok = True
+    for (snap, seed), ref in list(zip(snaps, orig))[1:]:  # 5 anchors (k=1..5)
+        outs = []
+        for rep in range(2):
+            restore_to(task, snap, mode, SMOKE_REPLAY_BUCKET)
+            p = prov.propose(task.policy_observation(), None, seed)
+            for t in range(C):
+                task.step(p.a0_env[t])
+            outs.append((task.state_vector(), task.proprio(), bool(task.success), int(task.elapsed), p.a0_env.copy()))
+        a = {"elapsed": int(snap.elapsed)}
+        ok = True
+        for name, idx in (("state", 0), ("proprio", 1), ("a0", 4)):
+            rr = compare(outs[0][idx], outs[1][idx], atol, rtol)        # repeatability
+            ro = compare(outs[0][idx], ref[idx], atol, rtol)            # vs the original continuation
+            a[f"{name}_repeat"] = rr
+            a[f"{name}_vs_original"] = ro
+            ok &= rr["ok"] and ro["ok"]
+        a["discrete_equal"] = bool(outs[0][2] == outs[1][2] == ref[2] and outs[0][3] == outs[1][3] == ref[3])
+        a["ok"] = bool(ok and a["discrete_equal"])
+        all_ok &= a["ok"]
+        res["anchors"].append(a)
+    res["restore_env_steps"] = task.counter.steps["smoke"] - n_replay0
     res["pass"] = bool(all_ok)
-    res["recommendation"] = "snapshot" if all_ok and res["vs_original_ok"] else "investigate; fallback restore_mode=replay"
+    res["recommendation"] = (f"restore_mode={mode} verified" if all_ok else
+                             f"restore_mode={mode} FAILED: inspect anchors; "
+                             + ("try --set restore_mode=replay and re-run --only 1 3" if mode == "snapshot"
+                                else "replay is not deterministic either: stop, do not collect the bank"))
     return res
 
 
@@ -231,10 +255,13 @@ def check45(cfg, task, prov, sp, out_dir: Path):
         res["nonterminal_full_chunks"] and res["load_same_actor"] and res["load_mu_not_reinit"] and \
         res["init_mu_zero"] and res["init_deterministic_action_zero"] and res["resume_num_timesteps_monotone"] \
         and res["resume_counter_matches"]
+    res["pass"] = bool(res["pass4"] and res["pass5"])
     return res
 
 
 def main():
+    from flow_residual_rl import fingerprint as fpr
+
     p = base_parser(__doc__)
     p.add_argument("--task-id", type=int, default=None)
     p.add_argument("--only", nargs="*", type=int, default=None)
@@ -248,41 +275,59 @@ def main():
     counter = StepCounter(out / "cost.json")
     counter.set_limit(("smoke",), cfg["smoke_env_step_limit"])
     prov = make_provider(cfg, counter)
-    with counter.charge("smoke"):
-        task = make_task(cfg, tid, counter, prov)
-        sp = task_splits(cfg, task)
-        write_json(out.parent / "tasks.json", _tasks_json(cfg))
-        write_manifest(cfg, out / "run_manifest.json", prov, {"splits": sp})
-        todo = a.only or [1, 2, 3, 4]
-        checks = {1: lambda: check1(cfg, task, prov, sp), 2: lambda: check2(cfg, task),
-                  3: lambda: check3(cfg, task, prov, sp), 4: lambda: check45(cfg, task, prov, sp, out)}
-        for n in todo:
-            key = f"check{n}" if n < 4 else "check4_5"
-            if not a.force and report.get(key, {}).get("pass", report.get(key, {}).get("pass5")):
-                print(f"[smoke] {key} already passed; skipping")
-                continue
-            try:
-                report[key] = checks[n]()
-            except BudgetExceeded as e:
-                report[key] = {"pass": False, "error": f"smoke budget: {e}"}
-            except Exception as e:  # noqa: BLE001
-                report[key] = {"pass": False, "error": repr(e), "traceback": traceback.format_exc()}
-            report["cost"] = counter.to_dict()
-            write_json(out / "smoke_report.json", report)
-            counter.save()
-            print(f"[smoke] {key}: {'PASS' if report[key].get('pass', report[key].get('pass5')) else 'FAIL'}")
-    summary = {k: (v.get("pass") if "pass" in v else (v.get("pass4"), v.get("pass5")))
-               for k, v in report.items() if isinstance(v, dict) and k.startswith("check")}
-    print("[smoke] summary:", summary, "| smoke env steps:", counter.steps["smoke"])
+    digest = None
+    try:
+        with counter.charge("smoke"):
+            task = make_task(cfg, tid, counter, prov)
+            sp = task_splits(cfg, task)
+            fp = fpr.smoke_fp(cfg, tid, prov, sp)
+            digest = fpr.sha_obj(fp)
+            write_json(out / "fingerprint.json", fp)
+            write_json(out.parent / "tasks.json", _tasks_json(cfg))
+            write_manifest(cfg, out / "run_manifest.json", prov, {"splits": sp, "smoke_fingerprint": digest})
+            todo = a.only or [1, 2, 3, 4]
+            checks = {1: lambda: check1(cfg, task, prov, sp), 2: lambda: check2(cfg, task),
+                      3: lambda: check3(cfg, task, prov, sp), 4: lambda: check45(cfg, task, prov, sp, out)}
+            for n in todo:
+                key = f"check{n}" if n < 4 else "check4_5"
+                prev = report.get(key)
+                if not a.force and check_passed(prev) and prev.get("fingerprint") == digest:
+                    print(f"[smoke] {key} already passed under the same fingerprint; skipping")
+                    continue
+                try:
+                    res = checks[n]()
+                except BudgetExceeded as e:
+                    res = {"pass": False, "error": f"smoke budget: {e}"}
+                except Exception as e:  # noqa: BLE001
+                    res = {"pass": False, "error": repr(e), "traceback": traceback.format_exc()}
+                res["fingerprint"] = digest
+                res["pass"] = check_passed(res)
+                report[key] = res
+                report["cost"] = counter.to_dict()
+                counter.save()
+                write_json(out / "smoke_report.json", report)
+                print(f"[smoke] {key}: {'PASS' if res['pass'] else 'FAIL'}")
+    finally:
+        counter.save()
+    summ = summarize(report, digest)
+    report["summary"] = summ
+    report["overall_pass"] = summ["overall_pass"]
+    write_json(out / "smoke_report.json", report)
+    print("[smoke] summary:", summ, "| smoke env steps:", counter.steps["smoke"])
+    if not summ["overall_pass"]:
+        print("[smoke] FAILED: do not start eval_base / bank / pilot until every check passes", file=sys.stderr)
+        sys.exit(1)
 
 
 def _tasks_json(cfg):
     from libero.libero import benchmark
 
+    from flow_residual_rl.envs.libero_task import load_task_init_states
+
     bm = benchmark.get_benchmark_dict()[cfg["suite"]]()
     return {"suite": cfg["suite"], "tasks": [{"task_id": i, "name": bm.get_task(i).name,
                                                "language": bm.get_task(i).language,
-                                               "n_init_states": len(bm.get_task_init_states(i))}
+                                               "n_init_states": len(load_task_init_states(bm, i))}
                                               for i in range(bm.get_num_tasks())],
             "pilot_task_id": cfg["pilot_task_id"], "main_task_ids": cfg["main_task_ids"]}
 

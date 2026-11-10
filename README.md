@@ -5,7 +5,7 @@ outputs `u ∈ [-1,1]^d`, mapped through a fixed basis `B ∈ R^{48×d}` to a bo
 (`RMS ≤ ε = 0.10` for every rank). Arms: `outcome12` (B learned from paired-intervention outcomes),
 `random12`, `dct12`, `pca12`, `full48`. Full spec: the agent plan (sec. 1–20).
 
-**Status:** implemented; contract tested on CPU with fakes only (`pytest`, 20 tests).
+**Status:** implemented; contract tested on CPU with fakes only (`pytest`, 31 tests + 1 that needs LIBERO and runs only in the container).
 **Nothing has run on the simulator or with GR00T yet**; the first real result is `scripts/smoke.py` on the cluster.
 
 ## Cluster setup (V100, Docker)
@@ -39,8 +39,26 @@ python scripts/run_pilot.py --config configs/pilot.yaml --stage B --resume  # on
 (`run_pilot` also builds a missing bank/basis itself.) Long runs: inside `tmux`; overrides via `--set key=value`.
 Use `PYTHONPATH=src` or `pip install -e .` for `python -m flow_residual_rl.report`.
 
-Smoke results → `runs/smoke/smoke_report.json`. If check 3 (restore) fails, inspect it, then set
-`--set restore_mode=replay` (prefix replay, cost charged to `bank_prefix_replay`) — do not loosen tolerances.
+Smoke results → `runs/smoke/smoke_report.json` (`overall_pass`); **the script exits 1 if any check fails**,
+so chain it: `python scripts/smoke.py ... && python scripts/eval_base.py ...`. If check 3 (restore) fails,
+inspect the anchors, then rerun with `--set restore_mode=replay --only 1 3` (checks 1 and 3 then go through
+prefix replay, the same `restore.restore_to` path the bank uses) — do not loosen `restore_atol/rtol`.
+Put the verified `restore_mode` into `configs/pilot.yaml` **before** collecting the bank.
+
+Safety rails (bf3fe64 review):
+* every cached/resumable artefact (smoke check, bank, basis, base_eval, cell) stores `fingerprint.json`
+  (config contract, checkpoint hashes, code of the contract modules, basis/normaliser/split hashes).
+  A mismatch stops with `ContractMismatch` instead of silently resuming: use a new `runs_dir`.
+  Online targets, block sizes, eval counts and wall ceilings may change freely.
+* `cost.json` is flushed every 200 steps and in `finally`; interrupted work is re-booked to
+  `aborted_bank/online/eval` on the next start and still counts (the bank hard limit includes `aborted_bank`).
+  A hard kill (SIGKILL/OOM) can lose at most 199 uncommitted steps.
+* a SAC block stops after the last transition is stored; model/replay are committed as one generation
+  (`gens/gen_<steps>`), evals load the policy checkpoint taken when the cell first crossed the eval step.
+* the bank drops groups whose zero branch does not reproduce the pool continuation and aborts after
+  `bank_max_restore_failures` such groups.
+* the Stage-A report returns `partial` (and Stage B will not start) unless all `stage_a_arms` have the
+  endpoint eval with the required episode count on the same schedule.
 
 ## Decisions taken from the actual sources (recorded in the resolved config / manifest)
 

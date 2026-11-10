@@ -38,7 +38,10 @@ bank_pool_max_steps: 4000
 bank_branch_horizon: 96
 bank_val_every: 4                      # every 4th pool episode is rolled out from a validation init state
 bank_seed: 7
-restore_mode: snapshot                 # snapshot | replay (set by restore check)
+restore_mode: snapshot                 # snapshot | replay (set by restore check; same path in smoke and bank)
+restore_atol: 1.0e-5                   # element-wise |a-b| <= atol + rtol*|b|, every state component
+restore_rtol: 1.0e-4
+bank_max_restore_failures: 3           # zero-branch vs pool continuation; failing groups are dropped, >= this aborts the bank
 
 basis_train_updates: 2000
 basis_lr: 0.001
@@ -81,3 +84,7 @@ smoke_sac_learning_starts: 4
 smoke_sac_batch_size: 8
 
 runs_dir: runs
+fingerprint_ignore: []                 # contract keys allowed to differ on resume (e.g. ["code.*"]); see fingerprint.py
+# cost.json is flushed every 200 charged steps (budget.DEFAULT_FLUSH_EVERY): a hard kill loses <= 199 uncommitted steps
+stage_a_gpu_hours: 24                  # wall-hour ceiling of Stage A (bank/basis/base eval of the pilot task included)
+project_gpu_hours: 96                  # whole-project ceiling: Stage B gets project_gpu_hours - Stage A wall hours

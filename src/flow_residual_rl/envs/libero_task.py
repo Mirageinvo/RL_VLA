@@ -24,6 +24,32 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 from ..budget import StepCounter
 
 
+def load_init_states_file(path) -> np.ndarray:
+    """Load one LIBERO `.pruned_init` file (a pickled numpy array saved with torch.save).
+
+    LIBERO's Benchmark.get_task_init_states calls torch.load(path) without weights_only; since
+    PyTorch 2.6 that defaults to weights_only=True and fails on numpy arrays (UnpicklingError,
+    numpy.core.multiarray._reconstruct). These files ship with the pinned LIBERO checkout and are
+    trusted, so they -- and only they -- are loaded with weights_only=False. No global torch.load change.
+    """
+    import torch
+
+    path = str(path)
+    assert path.endswith(".pruned_init") or path.endswith(".init"), path
+    arr = torch.load(path, weights_only=False)
+    arr = np.asarray(arr)
+    assert arr.ndim == 2 and arr.shape[0] > 0, (path, arr.shape)
+    return arr
+
+
+def load_task_init_states(bm, task_id: int) -> np.ndarray:
+    """Same file as bm.get_task_init_states(task_id), loaded via load_init_states_file."""
+    from libero.libero import get_libero_path
+
+    t = bm.get_task(task_id)
+    return load_init_states_file(os.path.join(get_libero_path("init_states"), t.problem_folder, t.init_states_file))
+
+
 def quat2axisangle(quat):
     quat = np.array(quat, dtype=np.float64)
     quat[3] = min(max(quat[3], -1.0), 1.0)
@@ -84,7 +110,7 @@ class LiberoTask:
         self.task_id = task_id
         self.suite = suite
         self.language = self.task.language
-        self.init_states = bm.get_task_init_states(task_id)
+        self.init_states = load_task_init_states(bm, task_id)
         bddl = os.path.join(get_libero_path("bddl_files"), self.task.problem_folder, self.task.bddl_file)
         self.env = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=camera_size, camera_widths=camera_size,
                                       ignore_done=True)

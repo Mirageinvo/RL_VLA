@@ -90,7 +90,9 @@ def test_sac_end_to_end_resume(tmp_path):
     assert counter.steps["online_train"] == st2["online_steps"]
     from flow_residual_rl.train_sac import ResidualSAC
 
-    m2 = ResidualSAC.load(tmp_path / "cell" / "model.zip", env=env)
+    from flow_residual_rl.train_sac import model_dir
+
+    m2 = ResidualSAC.load(model_dir(tmp_path / "cell", st2) / "model.zip", env=env)
     g = grad_report(m2)
     assert m2.replay_buffer is not None
     assert (tmp_path / "cell" / "policy_ckpts" / "policy_0000100.pt").exists()

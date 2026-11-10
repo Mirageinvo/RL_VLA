@@ -10,7 +10,16 @@
    frozen base policy (noise seeds shared relative to the anchor) for at most
    `bank_branch_horizon` steps from the anchor (incl. the modified chunk).
    y = 1 iff success inside the window.
-Every real env.step is charged to a bank_* bucket; the sum is hard-limited.
+Every real env.step is charged to a bank_* bucket; the sum (plus steps of crashed
+earlier attempts, `aborted_bank`) is hard-limited.
+
+Restore validity: every branch is started through restore.restore_to with the
+configured restore_mode (the path verified by smoke check 3). The zero branch's
+first chunk re-executes exactly the pool's own a0 from the same state, so its
+end state must equal the pool's next boundary (atol + rtol, element-wise). A group
+failing this check is dropped (its steps stay charged); after
+`bank_max_restore_failures` failures the bank is aborted (RestoreCheckFailed):
+the paired labels cannot be trusted.
 """
 from __future__ import annotations
 
@@ -25,8 +34,15 @@ from .basis import dct_basis
 from .budget import BudgetExceeded
 from .config import derive_seed, write_json
 from .envs.chunk_env import raw_obs_vector
+from .restore import compare, restore_to, tolerances
 
 BANK_BUCKETS = ("bank_pool", "bank_prefix_replay", "bank_branch", "bank_settling")
+# hard limit: this attempt's bank steps + steps of crashed earlier attempts
+BANK_LIMIT_BUCKETS = BANK_BUCKETS + ("aborted_bank",)
+
+
+class RestoreCheckFailed(RuntimeError):
+    pass
 
 
 @dataclass
@@ -50,7 +66,11 @@ def collect_pool(task, provider, cfg, split_ids, counter, log=print):
     bounds, episodes = [], []
     pool_limit = cfg["bank_pool_max_steps"]
     root = 0
-    while counter.steps["bank_pool"] + C <= pool_limit:
+    def room():  # this attempt's pool cap, and the hard bank limit incl. crashed attempts (+ possible settling)
+        return (counter.steps["bank_pool"] + C <= pool_limit
+                and counter.remaining(BANK_LIMIT_BUCKETS) >= C + cfg["settle_steps"])
+
+    while room():
         split = "validation" if (root % cfg["bank_val_every"] == cfg["bank_val_every"] - 1) else "train"
         ids = va if split == "validation" else tr
         sid = int(ids[(root // (cfg["bank_val_every"] if split == "validation" else 1)) % len(ids)])
@@ -59,7 +79,7 @@ def collect_pool(task, provider, cfg, split_ids, counter, log=print):
         k = 0
         with counter.charge("bank_pool"):
             while True:
-                if counter.steps["bank_pool"] + C > pool_limit:
+                if not room():
                     break
                 snap = task.snapshot()
                 prop = provider.propose(task.policy_observation(), None, derive_seed("pool", task.task_id, root, k))
@@ -121,10 +141,7 @@ def run_branch(task, provider, cfg, anchor_id, b: Boundary, delta, counter, rest
     C, W = cfg["execution_horizon"], cfg["bank_branch_horizon"]
     dims = list(cfg["corrected_dims"])
     t0, calls0 = time.time(), counter.base_calls
-    if restore_mode == "snapshot":
-        task.restore(b.snap)
-    else:
-        task.replay_restore(b.snap, bucket="bank_prefix_replay")
+    restore_to(task, b.snap, restore_mode, "bank_prefix_replay")
     a0 = b.proposal.a0_env
     a = a0.copy()
     a[:, dims] = np.clip(a0[:, dims] + delta, task.ACTION_LOW[dims], task.ACTION_HIGH[dims])
@@ -159,10 +176,14 @@ def run_branch(task, provider, cfg, anchor_id, b: Boundary, delta, counter, rest
     }
 
 
-def collect_groups(task, provider, cfg, bounds, anchor_idx, counter, out_dir: Path, start_id=0, log=print):
-    """Returns list of group dicts; stops cleanly if the bank budget would be exceeded."""
+def collect_groups(task, provider, cfg, bounds, anchor_idx, counter, out_dir: Path, start_id=0, log=print,
+                   rejected: list | None = None):
+    """Returns list of valid group dicts; stops cleanly if the bank budget would be exceeded.
+    Groups failing the restore check are appended to `rejected` (not returned)."""
     C, n_dims = cfg["execution_horizon"], len(cfg["corrected_dims"])
     W = cfg["bank_branch_horizon"]
+    atol, rtol = tolerances(cfg)
+    rejected = [] if rejected is None else rejected
     groups = []
     succ_ref = {(b.root, b.k): b for b in bounds}
     for j, i in enumerate(anchor_idx):
@@ -171,8 +192,8 @@ def collect_groups(task, provider, cfg, bounds, anchor_idx, counter, out_dir: Pa
         est = 3 * min(W, cfg["episode_cap"] - b.elapsed)
         if cfg["restore_mode"] == "replay":
             est += 3 * (b.elapsed + cfg["settle_steps"])
-        if counter.remaining(BANK_BUCKETS) < est:
-            log(f"[bank] stop: remaining {counter.remaining(BANK_BUCKETS)} < estimated group cost {est}")
+        if counter.remaining(BANK_LIMIT_BUCKETS) < est:
+            log(f"[bank] stop: remaining {counter.remaining(BANK_LIMIT_BUCKETS)} < estimated group cost {est}")
             break
         rng = np.random.default_rng(derive_seed("dir", cfg["bank_seed"], task.task_id, aid))
         delta, kind, radius = sample_direction(rng, C, n_dims, cfg["rank"], cfg["epsilon_rms"])
@@ -185,7 +206,11 @@ def collect_groups(task, provider, cfg, bounds, anchor_idx, counter, out_dir: Pa
             break
         # on-the-fly restore check: zero branch's first chunk == pool's own next boundary
         nxt = succ_ref.get((b.root, b.k + 1))
-        restore_err = float(np.abs(branches[0]["first_chunk_state"] - nxt.snap.sim_flat).max()) if nxt else float("nan")
+        if nxt is not None:
+            chk = compare(branches[0]["first_chunk_state"], nxt.snap.sim_flat, atol, rtol)
+            restore_err, restore_ok = chk["max_abs_err"], chk["ok"]
+        else:  # pool episode ended inside this chunk: no reference boundary
+            restore_err, restore_ok = float("nan"), None
         g = {
             "anchor_id": aid, "task_id": task.task_id, "root_episode_id": b.root, "split": b.split,
             "initial_state_id": b.snap.init_state_id, "elapsed_steps": b.elapsed, "boundary_k": b.k,
@@ -193,13 +218,23 @@ def collect_groups(task, provider, cfg, bounds, anchor_idx, counter, out_dir: Pa
             "base_seed": b.proposal.base_seed, "branch_seed_key": f"bank/{aid}/k",
             "a0_env": b.proposal.a0_env, "context": b.proposal.context, "proprio": b.proposal.proprio,
             "x_raw": raw_obs_vector(b.proposal, b.elapsed, cfg["episode_cap"]),
-            "sim_state": b.snap.sim_flat, "restore_err_vs_pool": restore_err,
+            "sim_state": b.snap.sim_flat, "restore_err_vs_pool": restore_err, "restore_ok": restore_ok,
             "branches": branches,
         }
+        if restore_ok is False:
+            rejected.append(g)
+            log(f"[bank] group {aid} REJECTED: zero branch != pool continuation (max err {restore_err:.2e}, "
+                f"atol={atol}, rtol={rtol}); failures so far {len(rejected)}")
+            counter.save()
+            if len(rejected) >= cfg["bank_max_restore_failures"]:
+                raise RestoreCheckFailed(
+                    f"{len(rejected)} groups failed the restore check (restore_mode={cfg['restore_mode']}); "
+                    "the paired labels are not trustworthy. Re-run smoke check 3 / switch restore_mode.")
+            continue
         groups.append(g)
         ys = [br["y"] for br in branches]
         log(f"[bank] group {aid} root={b.root} t={b.elapsed} split={b.split} y={ys} kind={kind} "
-            f"restore_err={restore_err:.2e} bank_steps={counter.total(BANK_BUCKETS)}")
+            f"restore_err={restore_err:.2e} bank_steps={counter.total(BANK_LIMIT_BUCKETS)}")
         counter.save()
     return groups
 
@@ -208,7 +243,7 @@ def discordant(groups, split):
     return sum(1 for g in groups if g["split"] == split and len({br["y"] for br in g["branches"]}) > 1)
 
 
-def save_bank(out_dir: Path, groups, episodes, meta):
+def save_bank(out_dir: Path, groups, episodes, meta, rejected=()):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     G = len(groups)
@@ -233,7 +268,11 @@ def save_bank(out_dir: Path, groups, episodes, meta):
     with open(out_dir / "groups.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r, default=float) + "\n")
-    write_json(out_dir / "bank_metadata.json", dict(meta, n_groups=G, n_discordant_train=discordant(groups, "train"),
+    with open(out_dir / "rejected_groups.jsonl", "w") as f:
+        for g in rejected:
+            f.write(json.dumps({k: g[k] for k in ("anchor_id", "root_episode_id", "elapsed_steps", "restore_err_vs_pool")},
+                               default=float) + "\n")
+    write_json(out_dir / "bank_metadata.json", dict(meta, n_groups=G, n_rejected_restore=len(rejected), n_discordant_train=discordant(groups, "train"),
                                                     n_discordant_val=discordant(groups, "validation"),
                                                     pool_episodes=episodes))
 

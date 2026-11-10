@@ -3,12 +3,22 @@
     python -m flow_residual_rl.report --runs runs/ --output reports/pilot/
 
 Decision rule (fixed before running, plan sec. 14), at the Stage-A endpoint:
+  partial     unless EVERY required arm (stage_a_arms) has a committed eval at the endpoint with the
+              required number of episodes on the identical eval schedule; missing cells are listed.
+              Stage B is only launched on `continue`.
   best_fixed = best of {random12, dct12, pca12 if present} by eval SR
   continue    if SR(outcome12) - SR(best_fixed) >= +5 pp  OR  dAUC(train SR curve) >= 0.03
   no_benefit  if SR(outcome12) - SR(best_fixed) <= -5 pp  AND dAUC <= 0
   setup_failure if every SAC arm is >= 10 pp below the base VLA (general RL/setup failure, not evidence about the space)
   uncertain   otherwise (one extra seed on the same task is allowed)
 These are compute-allocation rules, not statistical claims.
+`train_sr_auc` is the mean success of the stochastic TRAINING episodes over 5k-step bins: a
+diagnostic of learning speed, not held-out performance.
+
+Cost convention: `online_steps` per cell; the task's bank (pool + branches, incl. aborted attempts)
+is a shared preparation cost: the normaliser of EVERY arm is fit on it and outcome12/pca12 bases
+are learned from it. It is shown per task once (`bank_steps_task`) and counted once in the project
+total; `steps_incl_bank` = online + bank for every arm.
 """
 from __future__ import annotations
 
@@ -19,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 FIXED = ("random12", "dct12", "pca12")
+DEFAULT_REQUIRED = ("outcome12", "random12", "dct12", "full48")
 
 
 def _jsonl(p: Path):
@@ -103,7 +114,8 @@ def build_table(cells):
         for at, d in sorted(c["evals"].items()):
             s = d["summary"]
             rows.append({"task": c["task_id"], "seed": c["seed"], "arm": c["arm"], "online_steps": at,
-                         "steps_incl_bank": at + (c["bank_steps"] if c["arm"] in ("outcome12", "pca12") else 0),
+                         "policy_actual_online_steps": s.get("policy_actual_online_steps"),
+                         "bank_steps_task": c["bank_steps"], "steps_incl_bank": at + c["bank_steps"],
                          "SR": s["success_rate"], "n_eval": s["n_episodes"], "n_states": s["n_unique_states"],
                          "rms_median": s["rms_median"], "clip_mean": s["clip_mean"],
                          "trainable_params": c["status"].get("trainable_params"),
@@ -112,19 +124,62 @@ def build_table(cells):
     return rows
 
 
-def decide(cells, task_id, seed, at):
-    sel = {c["arm"]: c for c in cells if c["task_id"] == task_id and c["seed"] == seed and at in c["evals"]}
-    if "outcome12" not in sel:
-        return {"decision": "infrastructure_blocked_or_insufficient_signal", "reason": "no outcome12 eval at endpoint", "at": at}
+def _endpoint_status(cells, task_id, seed, at, required, n_required):
+    sel, missing = {}, []
+    for arm in required:
+        c = next((c for c in cells if c["task_id"] == task_id and c["seed"] == seed and c["arm"] == arm), None)
+        if c is None:
+            missing.append(f"{arm}: no cell")
+        elif at not in c["evals"]:
+            missing.append(f"{arm}: no eval at {at} (online={c['status'].get('online_steps', 0)})")
+        elif n_required and c["evals"][at]["summary"]["n_episodes"] < n_required:
+            missing.append(f"{arm}: eval at {at} has {c['evals'][at]['summary']['n_episodes']} < {n_required} episodes")
+        else:
+            sel[arm] = c
+    keys = {a: tuple(r["key"] for r in c["evals"][at]["episodes"]) for a, c in sel.items()}
+    if len(set(keys.values())) > 1:
+        missing.append(f"eval schedules differ across arms at {at}: {sorted(keys)}")
+    return sel, missing
+
+
+def compare_at(sel, at):
+    """Comparison of all available arms at one common eval point (diagnostic, any block)."""
     sr = {a: c["evals"][at]["summary"]["success_rate"] for a, c in sel.items()}
     fixed = [a for a in FIXED if a in sr]
-    best = max(fixed, key=lambda a: sr[a])
-    d_sr = sr["outcome12"] - sr[best]
-    aucs = {a: auc(c["train_eps"], at) for a, c in sel.items()}
-    d_auc = aucs["outcome12"] - aucs[best]
-    base_eps = sel["outcome12"]["base_eval"][: sel["outcome12"]["evals"][at]["summary"]["n_episodes"]]
-    base_sr = float(np.mean([r["success"] for r in base_eps])) if base_eps else float("nan")
-    if all(v <= base_sr - 0.10 for v in sr.values()):
+    out = {"at_online_steps": at, "SR": sr, "train_sr_auc": {a: auc(c["train_eps"], at) for a, c in sel.items()}}
+    if "outcome12" in sr and fixed:
+        best = max(fixed, key=lambda a: sr[a])
+        out.update(best_fixed=best, dSR_vs_best_fixed=sr["outcome12"] - sr[best],
+                   dAUC_vs_best_fixed=out["train_sr_auc"]["outcome12"] - out["train_sr_auc"][best],
+                   paired_bootstrap_vs_best_fixed=bootstrap_diff(sel["outcome12"]["evals"][at]["episodes"],
+                                                                 sel[best]["evals"][at]["episodes"]))
+    if "outcome12" in sr and "full48" in sr:
+        out["vs_full48"] = sr["outcome12"] - sr["full48"]
+    return out
+
+
+def decide(cells, task_id, seed, at, required=DEFAULT_REQUIRED, n_required=None):
+    required = tuple(required)
+    sel, missing = _endpoint_status(cells, task_id, seed, at, required, n_required)
+    # comparisons at every eval point all required arms share (each completed equal block)
+    points = sorted({k for c in cells if c["task_id"] == task_id and c["seed"] == seed for k in c["evals"]})
+    per_block = []
+    for p_ in points:
+        s_, m_ = _endpoint_status(cells, task_id, seed, p_, required, None)
+        per_block.append(dict(compare_at(s_, p_), complete=not m_, missing=m_))
+    base = {"at_online_steps": at, "task_id": task_id, "seed": seed, "required_arms": list(required),
+            "per_eval_point": per_block}
+    if missing:
+        return dict(base, decision="partial", missing=missing,
+                    reason="not every required arm has a committed eval at the endpoint; no Stage-B decision")
+    cmp = compare_at(sel, at)
+    sr, d_sr, d_auc = cmp["SR"], cmp["dSR_vs_best_fixed"], cmp["dAUC_vs_best_fixed"]
+    n_ep = sel["outcome12"]["evals"][at]["summary"]["n_episodes"]
+    base_eps = {r["episode"]: r for r in sel["outcome12"]["base_eval"]}
+    eval_eps = sel["outcome12"]["evals"][at]["episodes"]
+    base_sr = (float(np.mean([base_eps[r["episode"]]["success"] for r in eval_eps]))
+               if eval_eps and all(r["episode"] in base_eps for r in eval_eps) else float("nan"))
+    if np.isfinite(base_sr) and all(v <= base_sr - 0.10 for v in sr.values()):
         dec = "setup_failure"
     elif d_sr >= 0.05 or d_auc >= 0.03:
         dec = "continue"
@@ -132,11 +187,7 @@ def decide(cells, task_id, seed, at):
         dec = "no_benefit"
     else:
         dec = "uncertain"
-    ci = bootstrap_diff(sel["outcome12"]["evals"][at]["episodes"], sel[best]["evals"][at]["episodes"])
-    return {"decision": dec, "at_online_steps": at, "task_id": task_id, "seed": seed, "SR": sr, "base_SR": base_sr,
-            "best_fixed": best, "dSR_vs_best_fixed": d_sr, "train_auc": aucs, "dAUC_vs_best_fixed": d_auc,
-            "paired_bootstrap_vs_best_fixed": ci,
-            "vs_full48": (sr["outcome12"] - sr["full48"]) if "full48" in sr else None}
+    return dict(base, **cmp, decision=dec, base_SR=base_sr, n_eval_episodes=n_ep)
 
 
 def plots(cells, out: Path):
@@ -180,7 +231,16 @@ def main():
     p.add_argument("--stage-a-endpoint", type=int, default=60000)
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--seed", type=int, default=61)
+    p.add_argument("--config", default="configs/pilot.yaml",
+                   help="read stage_a_arms / stage_a_eval_episodes (required arms and episode count)")
     a = p.parse_args()
+    required, n_required = DEFAULT_REQUIRED, None
+    if a.config and Path(a.config).exists():
+        import yaml
+
+        cfg = yaml.safe_load(Path(a.config).read_text())
+        required = tuple(cfg["stage_a_arms"])
+        n_required = {int(k): v for k, v in cfg["stage_a_eval_episodes"].items()}.get(a.stage_a_endpoint)
     runs, out = Path(a.runs), Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
     cells = load_cells(runs)
@@ -203,9 +263,12 @@ def main():
             for k, n in vv.get("steps", {}).items():
                 tot[k] = tot.get(k, 0) + n
     cost["project_total_steps_by_bucket"] = tot
+    cost["project_total_steps"] = int(sum(tot.values()))
+    cost["convention"] = ("bank counted once per task (incl. aborted_bank); online/eval per cell; "
+                          "aborted_* = steps of interrupted work, kept in the totals")
     (out / "cost_report.json").write_text(json.dumps(cost, indent=1))
     plots(cells, out)
-    dec = decide(cells, a.task_id, a.seed, a.stage_a_endpoint)
+    dec = decide(cells, a.task_id, a.seed, a.stage_a_endpoint, required, n_required)
     (out / "stageA_decision.json").write_text(json.dumps(dec, indent=1))
     Path("reports").mkdir(exist_ok=True)
     (Path("reports") / "stageA_decision.json").write_text(json.dumps(dec, indent=1))
