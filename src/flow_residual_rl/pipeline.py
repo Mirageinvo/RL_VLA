@@ -1,6 +1,7 @@
 """Shared setup used by all entry points (one place, one implementation)."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -83,7 +84,8 @@ def write_manifest(cfg, path: Path, provider=None, extra=None):
     write_json(path, collect_manifest(cfg, e))
 
 
-WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+WEIGHT_INDEXES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+WEIGHT_SINGLE = ("model.safetensors", "pytorch_model.bin")
 BACKBONE_REPOS = ("nvidia/Cosmos-Reason2-2B",)
 
 
@@ -98,12 +100,23 @@ def _sha256_stream(path: Path, block: int = 1 << 24) -> str:
 
 
 def weights_identity(ckpt_dir, cache_path: Path | None = None) -> dict:
-    """sha256 of every weight file in the checkpoint dir. Full hashes are computed once and cached by
-    (size, mtime_ns); a replaced/modified file changes size or mtime and is re-hashed."""
+    """sha256 of the model weight files that from_pretrained actually loads: the shards listed in
+    model.safetensors.index.json (or a single model.safetensors / pytorch_model.bin). Training leftovers
+    (global_step*/ optimizer states, rng_state_*.pth, scheduler.pt, training_args.bin) are not hashed.
+    Full hashes are computed once and cached by (size, mtime_ns); a modified file is re-hashed."""
     p = Path(ckpt_dir)
     cache = read_json(cache_path, {}) if cache_path else {}
     out, changed = {}, False
-    for f in sorted(q for q in p.rglob("*") if q.is_file() and q.suffix in WEIGHT_SUFFIXES and ".cache" not in q.parts):
+    files = []
+    for idx in WEIGHT_INDEXES:
+        if (p / idx).exists():
+            files = sorted({p / v for v in json.loads((p / idx).read_text())["weight_map"].values()})
+            break
+    if not files:
+        files = [p / f for f in WEIGHT_SINGLE if (p / f).exists()]
+    for f in files:
+        if not f.exists():
+            raise FileNotFoundError(f"weight shard listed in the index is missing: {f}")
         st = f.stat()
         key = str(f.resolve())
         c = cache.get(key)

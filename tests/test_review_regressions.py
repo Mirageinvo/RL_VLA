@@ -244,7 +244,21 @@ def test_weights_identity_detects_replaced_weights(tmp_path):
     assert weights_identity(ck, cache) == h1  # cached
     (ck / "model.safetensors").write_bytes(b"b" * 1000)  # same size
     os.utime(ck / "model.safetensors", ns=(1, 1))
-    assert weights_identity(ck, cache) != h1
+    h2 = weights_identity(ck, cache)
+    assert h2 != h1
+    # training leftovers are not part of the model identity
+    (ck / "global_step18000").mkdir()
+    (ck / "global_step18000" / "optim_states.pt").write_bytes(b"x" * 100)
+    (ck / "rng_state_0.pth").write_bytes(b"r")
+    assert weights_identity(ck, cache) == h2
+    # sharded checkpoint: exactly the shards of the index
+    (ck / "model.safetensors").unlink()
+    for i in (1, 2):
+        (ck / f"model-0000{i}-of-00002.safetensors").write_bytes(bytes([i]) * 10)
+    (ck / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        "a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors",
+        "c": "model-00001-of-00002.safetensors"}}))
+    assert sorted(weights_identity(ck, cache)) == ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
 
 
 def test_fingerprint_covers_weights_and_projection(tmp_path):
