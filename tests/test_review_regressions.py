@@ -348,3 +348,61 @@ def test_wall_ledger_concurrent_beats(tmp_path, monkeypatch):
     led.close()
     assert not errors and json.loads(led.path.read_text())["finished"] is True
     assert led._t.is_alive() is False
+
+
+def _observable_cls():
+    obs_mod = pytest.importorskip("robosuite.utils.observables")
+    return obs_mod.Observable, obs_mod.sensor
+
+
+def test_snapshot_restores_robosuite_observable_timers():
+    """Smoke check3 on the cluster: MuJoCo state restored exactly but eef proprio off by ~1e-3,
+    because robosuite samples each observable on the first substep after its (python-side) timer
+    wraps. Restoring the timers must make the post-restore observation identical."""
+    from flow_residual_rl.envs.libero_task import observable_state, set_observable_state
+
+    Observable, sensor = _observable_cls()
+
+    class Env:  # robosuite base.step: n_substeps x (sim.step; _update_observables); return cached obs
+        model_timestep, n_sub = 0.002, 25
+
+        def __init__(self):
+            self.t, self._obs_cache = 0.0, {}
+
+            @sensor(modality="proprio")
+            def eef(obs_cache):
+                return np.array([self.t, self.t ** 2])
+
+            self._observables = {"eef": Observable("eef", eef, sampling_rate=20)}
+
+        def step(self):
+            for _ in range(self.n_sub):
+                self.t += self.model_timestep
+                for o in self._observables.values():
+                    o.update(self.model_timestep, self._obs_cache)
+            return np.array(self._observables["eef"].obs)
+
+        def forced_update(self):  # what LIBERO set_init_state -> regenerate_obs_from_state does
+            for o in self._observables.values():
+                o.update(self.model_timestep, self._obs_cache, force=True)
+
+    env = Env()
+    for _ in range(3):
+        env.step()
+    t0, st = env.t, observable_state(env)
+    ref = env.step()
+    for _ in range(2):
+        env.step()
+
+    def restore(with_observables):
+        env.t = t0
+        env.forced_update()
+        if with_observables:
+            set_observable_state(env, st)
+        return env.step()
+
+    assert not np.array_equal(restore(False), ref)  # the bug: sim state equal, observation not
+    assert np.array_equal(restore(True), ref)
+    assert np.array_equal(restore(True), ref)  # repeatable
+    with pytest.raises(RuntimeError):
+        set_observable_state(env, {"observables": {"other": {}}, "obs_cache": None})

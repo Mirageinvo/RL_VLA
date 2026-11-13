@@ -84,6 +84,38 @@ def proprio_vector(pobs: dict) -> np.ndarray:
     return np.concatenate([s[k] for k in ("x", "y", "z", "roll", "pitch", "yaw", "gripper")]).astype(np.float32)
 
 
+# robosuite Observable fields that define WHEN the next sample is taken and WHAT is returned.
+# env.step() runs ~25 MuJoCo substeps but each observable samples on the first substep after its
+# timer wraps; the timer phase is python state, so restoring only MuJoCo state makes the returned
+# proprio come from a different substep (smoke check3: sim state exact, eef pose off by ~1e-3).
+OBSERVABLE_FIELDS = ("_time_since_last_sample", "_sampled", "_current_delay", "_current_observed_value")
+
+
+def observable_state(env) -> dict:
+    """Sampling-timer state of every robosuite observable plus the shared observation cache.
+
+    Values are kept by reference, not deep-copied: robosuite 1.4 Observable.update and the obs
+    cache always bind NEW arrays (never write in place), and the bank keeps ~500 snapshots alive,
+    so copying the camera frames would cost hundreds of MB.
+    """
+    obs = getattr(env, "_observables", None) or {}
+    cache = getattr(env, "_obs_cache", None)
+    return {"observables": {n: {k: getattr(o, k) for k in OBSERVABLE_FIELDS if hasattr(o, k)} for n, o in obs.items()},
+            "obs_cache": dict(cache) if cache is not None else None}
+
+
+def set_observable_state(env, st: dict) -> None:
+    obs = getattr(env, "_observables", None) or {}
+    missing = set(st["observables"]) ^ set(obs)
+    if missing:
+        raise RuntimeError(f"observable set changed between snapshot and restore: {sorted(missing)}")
+    for n, attrs in st["observables"].items():
+        for k, v in attrs.items():
+            setattr(obs[n], k, v)
+    if st["obs_cache"] is not None:
+        env._obs_cache = dict(st["obs_cache"])
+
+
 @dataclass
 class Snapshot:
     init_state_id: int
@@ -198,7 +230,8 @@ class LiberoTask:
 
     def _py_state(self) -> dict:
         e = self.env.env
-        out = {"env": {k: copy.deepcopy(getattr(e, k)) for k in ("timestep", "cur_time", "done") if hasattr(e, k)}}
+        out = {"env": {k: copy.deepcopy(getattr(e, k)) for k in ("timestep", "cur_time", "done") if hasattr(e, k)},
+               "observables": observable_state(e)}
         for name, o in self._robot_objs().items():
             out[name] = {k: copy.deepcopy(v) for k, v in vars(o).items()
                          if isinstance(v, (np.ndarray, float, int, bool, np.floating, np.integer)) and not k.startswith("_")}
@@ -244,8 +277,10 @@ class LiberoTask:
         for k, v in snap.py_state["env"].items():
             setattr(e, k, copy.deepcopy(v))
         objs = self._robot_objs()
+        if "observables" in snap.py_state:  # after set_init_state's forced update, which advances the timers
+            set_observable_state(e, snap.py_state["observables"])
         for name, attrs in snap.py_state.items():
-            if name == "env" or name not in objs:
+            if name in ("env", "observables") or name not in objs:
                 continue
             for k, v in attrs.items():
                 setattr(objs[name], k, copy.deepcopy(v))
