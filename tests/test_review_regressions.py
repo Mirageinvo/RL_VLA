@@ -191,7 +191,7 @@ def test_crashed_block_is_booked_as_aborted(tmp_path, monkeypatch):
 
     cfg, task, prov, sp = _cell_setup(tmp_path)
     log = lambda *a: None  # noqa: E731
-    run_cell_block(cfg, task, prov, "dct12", 61, 200, sp, log)
+    committed = run_cell_block(cfg, task, prov, "dct12", 61, 200, sp, log)["online_steps"]  # 200 <= . < 200 + C
     orig = train_sac.ResidualSAC._store_transition
     calls = {"n": 0}
 
@@ -207,10 +207,10 @@ def test_crashed_block_is_booked_as_aborted(tmp_path, monkeypatch):
     monkeypatch.setattr(train_sac.ResidualSAC, "_store_transition", orig)
     cdir = cell_dir(cfg, 0, "dct12", 61)
     spent = json.loads((cdir / "cost.json").read_text())["steps"]["online_train"]
-    assert spent > 200  # the crashed steps reached disk (finally: save)
+    assert spent > committed  # the crashed steps reached disk (finally: save)
     st = run_cell_block(cfg, task, prov, "dct12", 61, 400, sp, log)
     cost = json.loads((cdir / "cost.json").read_text())["steps"]
-    assert cost["aborted_online"] == spent - 200 and cost["online_train"] == st["online_steps"]
+    assert cost["aborted_online"] == spent - committed and cost["online_train"] == st["online_steps"]
     # the crashed block's episode records were dropped: no episode appears twice in the training curve
     recs = [json.loads(l) for l in (cdir / "train_episodes.jsonl").read_text().splitlines() if l.strip()]
     keys = [r["key"] for r in recs]

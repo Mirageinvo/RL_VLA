@@ -120,3 +120,18 @@ def test_eval_paths_from_model_and_policy_ckpt(tmp_path):
     # zero-init actor mean == base policy on identical paired schedules
     assert s0["success_rate"] == s1["success_rate"] == s2["success_rate"]
     assert s0["n_unique_states"] == 3
+
+
+def test_sac_warmup_uses_configured_latent_map(tmp_path):
+    from flow_residual_rl.train_sac import make_sac
+
+    cfg = {"sac_lr": 3e-4, "sac_buffer_size": 1000, "sac_learning_starts_chunks": 256, "sac_batch_size": 256,
+           "smoke_sac_learning_starts": 4, "smoke_sac_batch_size": 8, "sac_tau": 0.005, "sac_gamma_chunk": 0.99,
+           "sac_train_freq_chunks": 1, "sac_gradient_steps": 1, "sac_ent_coef": "auto_0.01", "sac_hidden": [32, 32],
+           "sac_device": "cpu", "warmup_radius": [0.25, 1.0], "sac_log_std_bias_init": -3.0, "latent_map": "linear"}
+    env, task, counter = make_env(tmp_path, cap=64)
+    m = make_sac(env, cfg, 0, smoke=True)
+    assert m.latent_map == "linear"
+    a, _ = m._sample_action(4, n_envs=1)
+    mag = np.abs(a[0])
+    assert np.allclose(mag, mag[0]) and 0.25 - 1e-6 <= mag[0] <= 1.0 + 1e-6  # r * sign vector

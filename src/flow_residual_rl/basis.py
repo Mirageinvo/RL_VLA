@@ -4,10 +4,17 @@ All bases live in the flattened arm-correction space of size N = C * n_dims
 (row-major over [C, n_dims], i.e. index = t * n_dims + k), in env action units.
 Every basis B has shape [N, d] with B^T B = I.
 
-Map (plan sec. 7):
-    w     = u / max(1, ||u||_2)
-    delta = epsilon * sqrt(N) * B @ w        -> RMS(delta) <= epsilon for any d
+Map, selected by cfg["latent_map"] (same for every arm of an experiment):
+    "radial" (plan v1 sec. 7):  w = u / max(1, ||u||_2)
+    "linear" (after Stage A):   w = clip(u, -1, 1) / sqrt(d)
+    delta = epsilon * sqrt(N) * B @ w        -> RMS(delta) = epsilon * ||w|| <= epsilon for any d
     a_arm = clip(a0_arm + delta.reshape(C, n_dims), low, high)
+
+Why "linear": with "radial" every u outside the unit ball (almost all of the cube [-1,1]^d
+SAC acts in; already per-component |u| ~ 1/sqrt(d)) gives the full epsilon, so the actor
+can only choose a direction. Stage A: rms_actual == epsilon in every eval after warmup.
+With "linear" the magnitude is proportional to u, u = 0 stays the natural "no
+correction" point, and the same per-component |u| gives the same RMS for every rank.
 """
 from __future__ import annotations
 
@@ -18,6 +25,36 @@ from pathlib import Path
 import numpy as np
 
 ARM_NAMES = ("outcome12", "random12", "dct12", "pca12", "full48")
+LATENT_MAPS = ("radial", "linear")
+
+
+def latent_to_w(u: np.ndarray, latent_map: str) -> np.ndarray:
+    """Basis coefficients w with ||w|| <= 1 (so RMS(delta) <= epsilon)."""
+    u = np.asarray(u, dtype=np.float32)
+    if latent_map == "radial":
+        return u / max(1.0, float(np.linalg.norm(u)))
+    if latent_map == "linear":
+        return np.clip(u, -1.0, 1.0) / np.float32(np.sqrt(u.shape[-1]))
+    raise ValueError(f"latent_map must be one of {LATENT_MAPS}, got {latent_map!r}")
+
+
+def warmup_latent(rng: np.random.Generator, d: int, radius: tuple[float, float], latent_map: str,
+                  n: int = 1) -> np.ndarray:
+    """Warmup actions whose PHYSICAL RMS is r*epsilon, r ~ U[radius], for every rank d and map.
+
+    radial: r * (uniform direction on the unit sphere)       -> ||w|| = r
+    linear: r * (uniform random sign vector, a cube corner)  -> ||w|| = r*sqrt(d)/sqrt(d) = r
+    (inside the cube, ||w|| = r for r close to 1 is reachable only near the corners).
+    """
+    r = rng.uniform(*radius, size=(n, 1))
+    if latent_map == "radial":
+        v = rng.standard_normal((n, d))
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+    elif latent_map == "linear":
+        v = rng.choice(np.array([-1.0, 1.0]), size=(n, d))
+    else:
+        raise ValueError(f"latent_map must be one of {LATENT_MAPS}, got {latent_map!r}")
+    return (v * r).astype(np.float32)
 
 
 def thin_qr(w: np.ndarray) -> np.ndarray:
@@ -88,12 +125,14 @@ class ResidualMap:
     epsilon: float
     low: np.ndarray  # env action bounds, [A]
     high: np.ndarray
+    latent_map: str = "radial"
 
     def __post_init__(self):
         self.basis = np.asarray(self.basis, dtype=np.float32)
         self.n = self.chunk * len(self.corrected_dims)
         assert self.basis.shape[0] == self.n, (self.basis.shape, self.n)
         check_orthonormal(self.basis)
+        assert self.latent_map in LATENT_MAPS, self.latent_map
         self.scale = self.epsilon * np.sqrt(self.n)
 
     @property
@@ -102,8 +141,7 @@ class ResidualMap:
 
     def delta(self, u: np.ndarray) -> np.ndarray:
         """Planned correction [C, n_dims] before clipping."""
-        u = np.asarray(u, dtype=np.float32).reshape(self.dim)
-        w = u / max(1.0, float(np.linalg.norm(u)))
+        w = latent_to_w(np.asarray(u, dtype=np.float32).reshape(self.dim), self.latent_map)
         return (self.scale * (self.basis @ w)).reshape(self.chunk, len(self.corrected_dims))
 
     def apply(self, a0: np.ndarray, u: np.ndarray) -> tuple[np.ndarray, dict]:

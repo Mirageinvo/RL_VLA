@@ -59,7 +59,12 @@ def basis_for_arm(cfg, arm: str, task_id: int) -> np.ndarray:
 
 def residual_map(cfg, basis, task) -> ResidualMap:
     return ResidualMap(basis, cfg["execution_horizon"], tuple(cfg["corrected_dims"]), cfg["epsilon_rms"],
-                       task.ACTION_LOW, task.ACTION_HIGH)
+                       task.ACTION_LOW, task.ACTION_HIGH, latent_map=latent_map(cfg))
+
+
+def latent_map(cfg) -> str:
+    """Configs written before the key existed meant the plan-v1 radial map."""
+    return cfg.get("latent_map", "radial")
 
 
 def obs_dim(cfg) -> int:

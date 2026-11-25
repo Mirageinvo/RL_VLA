@@ -127,10 +127,14 @@ def check2(cfg, task):
         for _ in range(200):
             u = rng.uniform(-1, 1, rm.dim).astype(np.float32) * rng.uniform(0, 3)
             rms.append(float(np.sqrt(np.mean(rm.delta(u) ** 2))))
+        half = float(np.sqrt(np.mean(rm.delta(np.full(rm.dim, 0.5, np.float32)) ** 2)))  # every |u_i| = 0.5
         res[arm] = {"shape": list(b.shape), "dtype": str(b.dtype), "orth_err": check_orthonormal(b),
-                    "rms_max": max(rms), "rms_bound_ok": max(rms) <= cfg["epsilon_rms"] * (1 + 1e-5)}
+                    "rms_max": max(rms), "rms_bound_ok": max(rms) <= cfg["epsilon_rms"] * (1 + 1e-5),
+                    "latent_map": rm.latent_map, "rms_at_u_half": half}
     expected = cfg["execution_horizon"] * len(cfg["corrected_dims"])
-    res["pass"] = all(v["rms_bound_ok"] and v["shape"][0] == expected and v["dtype"] == "float32"
+    # linear map: no radial saturation, |u_i| = 0.5 -> RMS = 0.5 * epsilon for every rank
+    lin_ok = lambda v: v["latent_map"] != "linear" or abs(v["rms_at_u_half"] - 0.5 * cfg["epsilon_rms"]) <= 1e-4 * cfg["epsilon_rms"]
+    res["pass"] = all(v["rms_bound_ok"] and v["shape"][0] == expected and v["dtype"] == "float32" and lin_ok(v)
                       for k, v in res.items() if isinstance(v, dict))
     return res
 

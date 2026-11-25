@@ -66,6 +66,8 @@ sac_ent_coef: auto_0.01
 sac_log_std_bias_init: -3.0
 sac_device: cpu
 warmup_radius: [0.25, 1.0]
+latent_map: linear                     # u -> w: "linear" w = clip(u)/sqrt(d) (post-Stage-A fix); "radial" w = u/max(1,|u|) = plan v1,
+                                       # saturated at epsilon in every Stage A eval (see basis.py). Stage A v1 cells were produced with radial.
 
 stage_a_online_first_steps: 20000
 stage_a_online_final_steps: 60000

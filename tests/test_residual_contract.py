@@ -19,19 +19,52 @@ def bases():
             "pca12": pca_basis(rng.standard_normal((200, N)), D), "qr": thin_qr(rng.standard_normal((N, D)))}
 
 
+@pytest.mark.parametrize("latent_map", ["radial", "linear"])
 @pytest.mark.parametrize("name", ["random12", "dct12", "full48", "pca12", "qr"])
-def test_orthonormal_and_rms_bound(name):
+def test_orthonormal_and_rms_bound(name, latent_map):
     b = bases()[name]
     assert b.dtype == np.float32 and b.shape[0] == N
     check_orthonormal(b)
-    rm = ResidualMap(b, C, tuple(range(6)), EPS, LO, HI)
+    rm = ResidualMap(b, C, tuple(range(6)), EPS, LO, HI, latent_map=latent_map)
     rng = np.random.default_rng(1)
     for _ in range(500):
         u = rng.uniform(-1, 1, rm.dim) * rng.uniform(0, 3)
         rms = np.sqrt(np.mean(rm.delta(u) ** 2))
-        w = np.linalg.norm(u) / max(1.0, np.linalg.norm(u))
+        if latent_map == "radial":
+            w = np.linalg.norm(u) / max(1.0, np.linalg.norm(u))
+        else:
+            w = np.linalg.norm(np.clip(u, -1, 1)) / np.sqrt(rm.dim)
         assert rms <= EPS * (1 + 1e-5)
         np.testing.assert_allclose(rms, EPS * w, rtol=1e-4)  # same physical RMS for any rank
+
+
+def test_linear_map_does_not_saturate_and_is_rank_invariant():
+    """Stage A regression: with the radial map a moderate u (|u_i| = 0.3) already gave the full
+    epsilon for d=12 and d=48; the linear map gives 0.3 * epsilon for every rank."""
+    for name in ("random12", "dct12", "full48"):
+        b = bases()[name]
+        u = np.full(b.shape[1], 0.3, np.float32)
+        radial = ResidualMap(b, C, tuple(range(6)), EPS, LO, HI, latent_map="radial")
+        linear = ResidualMap(b, C, tuple(range(6)), EPS, LO, HI, latent_map="linear")
+        np.testing.assert_allclose(np.sqrt(np.mean(radial.delta(u) ** 2)), EPS, rtol=1e-5)
+        np.testing.assert_allclose(np.sqrt(np.mean(linear.delta(u) ** 2)), 0.3 * EPS, rtol=1e-5)
+    with pytest.raises(AssertionError):
+        ResidualMap(bases()["dct12"], C, tuple(range(6)), EPS, LO, HI, latent_map="bogus")
+
+
+@pytest.mark.parametrize("latent_map", ["radial", "linear"])
+def test_warmup_physical_rms_identical_across_ranks(latent_map):
+    from flow_residual_rl.basis import warmup_latent
+
+    for name in ("random12", "full48"):
+        rm = ResidualMap(bases()[name], C, tuple(range(6)), EPS, LO, HI, latent_map=latent_map)
+        rng = np.random.default_rng(0)
+        u = warmup_latent(rng, rm.dim, (0.25, 1.0), latent_map, n=400)
+        r = warmup_latent(np.random.default_rng(0), rm.dim, (0.25, 1.0), latent_map, n=400)
+        assert np.array_equal(u, r) and np.all(np.abs(u) <= 1.0)
+        rms = np.array([np.sqrt(np.mean(rm.delta(x) ** 2)) for x in u])
+        radius = np.random.default_rng(0).uniform(0.25, 1.0, size=(400, 1))[:, 0]  # first draw of warmup_latent
+        np.testing.assert_allclose(rms, EPS * radius, rtol=1e-4)
 
 
 def test_zero_u_is_bit_exact_including_gripper():

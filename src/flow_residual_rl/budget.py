@@ -32,6 +32,7 @@ BUCKETS = (
     "evaluation",
     "eval_settling",
     "smoke",
+    "diagnostic",
     "aborted_bank",
     "aborted_online",
     "aborted_eval",

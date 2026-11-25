@@ -26,7 +26,7 @@ SRC = Path(__file__).resolve().parent
 COMMON_KEYS = ("suite", "checkpoint_dir", "embodiment_tag", "model_dtype", "execution_horizon", "episode_cap",
                "settle_steps", "camera_size", "context_dim", "context_projection_seed", "split_seed",
                "split_fractions", "restore_mode", "restore_atol", "restore_rtol")
-ACTION_KEYS = ("rank", "corrected_dims", "epsilon_rms", "random_basis_seed")
+ACTION_KEYS = ("rank", "corrected_dims", "epsilon_rms", "random_basis_seed", "latent_map")
 BANK_KEYS = ("bank_budget_steps", "bank_max_steps_with_rescue", "bank_anchor_target", "bank_pool_max_steps",
              "bank_branch_horizon", "bank_val_every", "bank_seed", "bank_max_restore_failures")
 BASIS_KEYS = ("basis_train_updates", "basis_lr", "basis_weight_decay", "basis_pair_weight", "basis_batch_groups",

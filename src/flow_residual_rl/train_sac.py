@@ -2,8 +2,9 @@
 
 * actor mean head zero-initialised, log_std head weights 0 / bias -3 — only when a
   fresh model is created (never after load);
-* warmup samples u = r * direction, direction uniform on the unit sphere of R^d,
-  r ~ U[warmup_radius]; since delta = eps*sqrt(N)*B w with orthonormal B, the
+* warmup samples u with physical RMS r*eps, r ~ U[warmup_radius], for every arm and
+  latent map (basis.warmup_latent): radial -> r * unit-sphere direction, linear ->
+  r * random sign vector; since delta = eps*sqrt(N)*B w with orthonormal B, the
   physical RMS distribution is identical for every arm;
 * training proceeds in env-step blocks. A block stops right AFTER the transition
   that reaches the target has been stored in the replay buffer (SB3 would drop it
@@ -28,6 +29,7 @@ import torch
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 
+from .basis import warmup_latent
 from .config import read_json, write_json
 
 
@@ -36,8 +38,9 @@ class BlockDone(Exception):
 
 
 class ResidualSAC(SAC):
-    def __init__(self, *args, warmup_radius=(0.25, 1.0), warmup_seed: int = 0, **kw):
+    def __init__(self, *args, warmup_radius=(0.25, 1.0), warmup_seed: int = 0, latent_map: str = "radial", **kw):
         self.warmup_radius = tuple(warmup_radius)
+        self.latent_map = latent_map
         self._warm_rng = np.random.default_rng(warmup_seed)
         self._stop_after_store = False
         super().__init__(*args, **kw)
@@ -50,11 +53,8 @@ class ResidualSAC(SAC):
 
     def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
         if self.num_timesteps < learning_starts:
-            d = self.action_space.shape[0]
-            v = self._warm_rng.standard_normal((n_envs, d))
-            v /= np.linalg.norm(v, axis=1, keepdims=True)
-            r = self._warm_rng.uniform(*self.warmup_radius, size=(n_envs, 1))
-            a = (v * r).astype(np.float32)
+            a = warmup_latent(self._warm_rng, self.action_space.shape[0], self.warmup_radius,
+                              getattr(self, "latent_map", "radial"), n_envs)
             return a, a  # Box[-1,1]: scaled == unscaled
         return super()._sample_action(learning_starts, action_noise, n_envs)
 
@@ -82,7 +82,7 @@ def make_sac(env, cfg: dict, seed: int, smoke: bool = False) -> ResidualSAC:
         ent_coef=cfg["sac_ent_coef"], target_entropy=-float(d), use_sde=False,
         policy_kwargs=dict(net_arch=dict(pi=list(cfg["sac_hidden"]), qf=list(cfg["sac_hidden"]))),
         device=cfg["sac_device"], seed=seed, verbose=0,
-        warmup_radius=cfg["warmup_radius"], warmup_seed=seed + 1,
+        warmup_radius=cfg["warmup_radius"], warmup_seed=seed + 1, latent_map=cfg.get("latent_map", "radial"),
     )
     init_actor_heads(model, cfg["sac_log_std_bias_init"])
     return model

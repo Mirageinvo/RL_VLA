@@ -72,6 +72,26 @@ Safety rails (bf3fe64 review):
 * the Stage-A report returns `partial` (and Stage B will not start) unless all `stage_a_arms` have the
   endpoint eval with the required episode count on the same schedule.
 
+## After Stage A (v1): latent map fix and diagnostics
+
+Stage A v1 (`latent_map: radial`, the plan-v1 map `w = u / max(1, ||u||)`) saturated: `rms_actual = epsilon`
+in every evaluation after warmup, i.e. the actor could only choose a direction, never a magnitude.
+`latent_map: linear` (now the default in `configs/pilot.yaml`) uses `w = clip(u) / sqrt(d)`: same bound
+RMS <= epsilon, magnitude proportional to u, rank-invariant; warmup draws `r * (random sign vector)` so the
+physical RMS is still `r * epsilon` for every arm. `latent_map` is part of the fingerprint: the v1 artefacts
+in `runs/` cannot be resumed under it (archive them; start the next RL series in a fresh `runs_dir`).
+
+No new bank / RL before these two diagnostics:
+```bash
+python scripts/jacobian_diag.py --config configs/pilot.yaml --task-id 0   # ~26k env steps, real sim
+python scripts/jacobian_diag.py --config configs/pilot.yaml --task-id 0 --analyze-only   # re-run the analysis offline
+python scripts/profile_sac.py  --config configs/pilot.yaml                 # SAC update cost vs torch threads, no sim
+```
+`jacobian_diag` measures central-difference Jacobians of the physical effect (eef pose via relative rotations,
+gripper, every object pose) after s = 1..8 steps on phase-stratified anchors, compares integrator / fixed-lag /
+global models on held-out episodes, and validates DCT / model / local-oracle shape subspaces with real
+interventions plus one GR00T continuation chunk. Output: `runs/diagnostics/jacobian_task<id>/analysis.md`.
+
 ## Decisions taken from the actual sources (recorded in the resolved config / manifest)
 
 | Item | Value | Source |
@@ -94,7 +114,8 @@ Budget note: with cap 720 the worst-case evaluation bound in plan sec. 14 scales
 ```
 configs/pilot.yaml                     single config
 src/flow_residual_rl/
-  basis.py            bases + fixed u→Δ map (ResidualMap)
+  basis.py            bases + fixed u→Δ map (ResidualMap, latent_map radial|linear)
+  effects.py          physical-effect Jacobians, integrator/lag/global models, OER bases
   outcome_predictor.py  QR basis + MLP predictor, BCE + pairwise loss
   providers/gr00t.py  frozen GR00T provider (propose → a0_env, context, proprio)
   envs/libero_task.py LIBERO task, obs, snapshot/restore/replay
@@ -105,7 +126,7 @@ src/flow_residual_rl/
   stages.py           bank / basis / eval / cell logic shared by scripts
   budget.py           env-step accounting (cost.json, hard limits)
   report.py           tables, curves, cost, Stage-A decision
-scripts/{smoke,eval_base,collect_bank,train_basis,run_pilot}.py
+scripts/{smoke,eval_base,collect_bank,train_basis,run_pilot,jacobian_diag,profile_sac}.py
 docker/               V100 image (cu126 torch, no flash-attn)
 runs/<suite>_task<id>/{splits.json, bank/, basis/, base_eval/, cells/<arm>_seed<s>/}
 ```
