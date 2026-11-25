@@ -173,9 +173,12 @@ def main():
                         num_l, num_g, den = num_l + el ** 2, num_g + eg ** 2, den + float(e @ e)
                         tiny_n += np.linalg.norm(e) < thr
                     al, ag = (np.median([np.mean([v[k] for v in vs]) for vs in by.values()]) * 1e3 for k in (0, 1))
-                    pl, pg = (np.sqrt(x / den) if den > 0 else float("nan") for x in (num_l, num_g))
+                    # all true effects ~0 (e.g. no object moves): a pooled ratio would be 0/0 noise
+                    pl, pg = (np.sqrt(x / den) if tiny_n < len(rows_m) else float("nan") for x in (num_l, num_g))
                     cells.append(f"{al:9.3f} / {ag:<8.3f} {pl:7.2f} / {pg:<6.2f} {tiny_n:>3}/{len(rows_m):<3}")
                 print(f"{m:<12} {g:<13} " + " ".join(cells))
+        print("   note: local_* bases lie in the null space of their own J_C rows, so their local prediction at s=C is 0")
+        print("   by construction (pooled = 1.00 there is not a model error; read the abs column)")
 
 if __name__ == "__main__":
     main()
