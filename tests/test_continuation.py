@@ -79,7 +79,8 @@ def _anchors(task):
     out = []
     for i in range(4):
         task.restore((np.array([0.01 * i, 0, 0]), np.eye(3), np.zeros(6)))
-        out.append({"ep": i, "k": 0, "split": "fit" if i % 2 == 0 else "heldout", "snap": task.snapshot(),
+        out.append({"ep": i, "sid": 10 + i, "k": 0, "elapsed": 8 * i, "split": "fit" if i % 2 == 0 else "heldout",
+                    "snap": task.snapshot(),
                     "a0": np.full((C, 7), 0.1 + 0.01 * i), "phase": {"phase": "free" if i < 2 else "contact"}})
     return out
 
@@ -121,7 +122,7 @@ def _source(src, task, prov, a0_shift=0.0):
     (src / "validation.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
 
 
-def _run(tmp_path, monkeypatch, reactive, a0_shift=0.0):
+def _run(tmp_path, monkeypatch, reactive, a0_shift=0.0, fresh=False, tamper=None, pool_shift=0):
     cd = _load("continuation_diag")
     jd = sys.modules["jacobian_diag"] if "jacobian_diag" in sys.modules else _load("jacobian_diag")
     import flow_residual_rl.budget as budget
@@ -131,8 +132,18 @@ def _run(tmp_path, monkeypatch, reactive, a0_shift=0.0):
     task, prov = FakeTask(alpha=0.6), FakeProvider(reactive)
     src, out = tmp_path / "jacobian_task0", tmp_path / "continuation_task0"
     _source(src, task, prov, a0_shift)
+    if tamper:
+        raw = dict(np.load(src / "validation_raw.npz"))
+        tamper(raw["effects"])
+        np.savez_compressed(src / "validation_raw.npz", **raw)
+
+    def pool(*_a, **_k):
+        out = _anchors(task)
+        out[1]["elapsed"] += pool_shift
+        return out
+
     out.mkdir()
-    monkeypatch.setattr(jd, "collect_pool", lambda *a, **k: _anchors(task))
+    monkeypatch.setattr(jd, "collect_pool", pool)
     monkeypatch.setattr(jd, "select_anchors", lambda bounds, n, seed: bounds)
     monkeypatch.setattr(cd, "measure", _measure)
     monkeypatch.setattr(budget, "StepCounter", FakeCounter)
@@ -143,7 +154,9 @@ def _run(tmp_path, monkeypatch, reactive, a0_shift=0.0):
     monkeypatch.setattr(rs, "restore_to", lambda t, s, mode, bucket: t.restore(s))
 
     class A:
-        methods, a0_tol, step_limit, task_id = ["dct", "lag", "global_gram", "local_eef"], 1e-4, 10000, 0
+        methods, a0_tol, repro_tol, step_limit, task_id = ["dct", "lag", "global_gram", "local_eef"], 1e-4, 1e-5, 10000, 0
+
+    A.fresh = fresh
 
     code = cd.collect({"restore_mode": "snapshot"}, A, src, out)
     return cd, code, src, out
@@ -180,3 +193,60 @@ def test_pool_not_reproduced_runs_nothing(tmp_path, monkeypatch):
     assert code == 4
     assert not (out / "continuation.npz").exists()
     assert json.loads((out / "reproduction.json").read_text())["a0_max_diff"] == pytest.approx(1e-3)
+
+
+def _snaps(out):
+    import pickle
+
+    with open(out / "anchor_snaps.pkl", "rb") as f:
+        return pickle.load(f)
+
+
+def test_reuse_run_is_verified_and_reports_paired_protocol_difference(tmp_path, monkeypatch):
+    cd, code, src, out = _run(tmp_path, monkeypatch, reactive=True)
+    rp = json.loads((out / "reproduction.json").read_text())
+    assert code == 0 and rp["complete"] and rp["mode"] == "reuse"
+    assert all(v == 0.0 for v in rp["fixed_first_C_max_diff"].values())
+    assert _snaps(out)["verified"] is True
+    md = cd.analyze(src, out)
+    assert "re-planned vs fixed, per anchor d_i" in md and "| local_eef | 2 |" in md
+
+
+def test_saved_replanned_continuation_mismatch_blocks(tmp_path, monkeypatch):
+    """Review: a 0.05 mismatch of the saved re-planned branch was only logged (exit 0, complete)."""
+
+    def tamper(e):
+        e[:, C:] += 0.05
+
+    _, code, _, out = _run(tmp_path, monkeypatch, reactive=True, tamper=tamper)
+    rp = json.loads((out / "reproduction.json").read_text())
+    assert code == 4 and rp["complete"] is False and "re-planned branch differs" in rp["failed"]
+    assert _snaps(out)["verified"] is False
+
+
+def test_corrected_chunk_mismatch_in_any_branch_blocks(tmp_path, monkeypatch):
+    def tamper(e):
+        e[12 + 2 * METHODS.index("local_eef") + 1, 2] += 1e-3  # anchor 3, local_eef, sign -1: not the checked re-planned one
+
+    _, code, _, out = _run(tmp_path, monkeypatch, reactive=True, tamper=tamper)
+    rp = json.loads((out / "reproduction.json").read_text())
+    assert code == 4 and "corrected chunk differs" in rp["failed"]
+
+
+def test_anchor_identity_includes_elapsed(tmp_path, monkeypatch):
+    _, code, _, out = _run(tmp_path, monkeypatch, reactive=False, pool_shift=8)
+    rp = json.loads((out / "reproduction.json").read_text())
+    assert code == 4 and rp["same_anchors"] is False and not (out / "anchor_snaps.pkl").exists()
+
+
+def test_fresh_mode_reruns_both_protocols(tmp_path, monkeypatch):
+    def tamper(e):
+        e += 0.05  # saved effects are not used in fresh mode
+
+    cd, code, src, out = _run(tmp_path, monkeypatch, reactive=False, a0_shift=1e-3, fresh=True, tamper=tamper)
+    rp = json.loads((out / "reproduction.json").read_text())
+    assert code == 0 and rp["complete"] and rp["mode"] == "fresh"
+    z = np.load(out / "continuation.npz")
+    np.testing.assert_allclose(z["e_fixed"], z["e_replanned"], atol=1e-12)  # open-loop policy: protocols coincide
+    assert _snaps(out)["verified"] is False
+    assert "mode: fresh" in cd.analyze(src, out)

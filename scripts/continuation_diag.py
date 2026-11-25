@@ -18,13 +18,20 @@ corrected actions as the Jacobian validation:
 | dct shrinks only if replanned | GR00T compensates the perturbation                  |
 
 Snapshots are not stored by jacobian_diag.py, so the pool is re-collected with the same seeds
-and the same anchors are selected; every anchor's GR00T proposal a0 must match the stored one
-(--a0-tol), otherwise nothing is run (exit 4). The snapshots are then pickled for later
-experiments. Also recorded: arm joint position / velocity differences at s=C.
+and the same anchors are selected (ep, sid, k, elapsed, split must match). Reuse mode (default):
+the nominal chunk is the STORED a0 (must match the new proposal within --a0-tol); the corrected
+chunk of EVERY branch must reproduce the saved effects of steps 1..C, and one saved re-planned
+branch per anchor must be reproduced over 1..2C (--repro-tol); any failure stops the run,
+leaves it incomplete and exits 4. --fresh: no comparison with saved effects; both protocols are
+re-run from the new snapshots with the same executed corrections (an independent paired
+comparison). anchor_snaps.pkl is marked verified only after a complete reuse-mode run.
+Also recorded: arm joint position / velocity differences at s=C. The report adds the per-anchor
+paired d_i = log(replanned / fixed drift at s=2C).
 
   python scripts/continuation_diag.py --config configs/pilot.yaml --task-id 0
   python scripts/continuation_diag.py --task-id 0 --analyze-only
-Output: runs/diagnostics/continuation_task<id>/ (exit 2: incomplete, 4: anchors not reproduced)
+  python scripts/continuation_diag.py --config configs/pilot.yaml --task-id 0 --fresh --force
+Output: runs/diagnostics/continuation_task<id>/ (exit 2: incomplete, 4: not reproduced)
 """
 import json
 import pickle
@@ -81,7 +88,7 @@ def collect(cfg, a, src, out):
 
     S = load_source(src)
     anc, vmeta = S["anc"], S["vmeta"]
-    sargs, C, methods_all = anc["args"], anc["C"], vmeta["methods"]
+    sargs, C, methods_all, dims = anc["args"], anc["C"], vmeta["methods"], list(anc["dims"])
     counter = StepCounter(out / "cost.json")
     counter.set_limit(("diagnostic",), a.step_limit)
     prov = make_provider(cfg, counter)
@@ -91,33 +98,56 @@ def collect(cfg, a, src, out):
     def restore(t, s):
         restore_to(t, s, cfg["restore_mode"], "diagnostic")
 
+    def snaps(anchors, verified):
+        with open(out / "anchor_snaps.pkl", "wb") as f:
+            pickle.dump({"verified": verified, "mode": "fresh" if a.fresh else "reuse",
+                         "anchors": [{"ep": b["ep"], "sid": b["sid"], "k": b["k"], "elapsed": b["elapsed"],
+                                      "split": b["split"], "phase": b["phase"]["phase"], "snap": b["snap"], "a0": b["a0"]}
+                                     for b in anchors]}, f)
+
+    def branch(b, act, cont, cont_seed):
+        """Chunk `act`, then `cont` (fixed) or a GR00T re-plan (cont=None). States after every step."""
+        st, _ = fx.execute(task, b["snap"], act, restore, measure)
+        for x in (cont if cont is not None else prov.propose(task.policy_observation(), None, cont_seed).a0_env):
+            task.step(x)
+            st.append(measure(task))
+        return st
+
+    def fail(check, why):
+        log(f"[repro] FAILED: {why}")
+        write_json(out / "reproduction.json", dict(check, complete=False, failed=why))
+        return 4
+
     try:
         with counter.charge("diagnostic"):
             # ---- same pool, same anchors
             bounds = collect_pool(task, prov, task_splits(cfg, task)["train"], sargs["pool_episodes"], C)
             anchors = select_anchors(bounds, sargs["n_anchors"], sargs["seed"])
-            old = anc["anchors"]
-            ident = [(b["ep"], b["k"], b["split"]) for b in anchors] == [(b["ep"], b["k"], b["split"]) for b in old]
+            ident_keys = ("ep", "sid", "k", "elapsed", "split")
+            ident = [tuple(b[k] for k in ident_keys) for b in anchors] == [tuple(b[k] for k in ident_keys) for b in anc["anchors"]]
             da0 = [float(np.abs(b["a0"] - S["a0"][i]).max()) for i, b in enumerate(anchors)] if ident else []
-            check = {"same_anchors": ident, "a0_max_diff": max(da0) if da0 else None, "a0_tol": a.a0_tol,
-                     "per_anchor_a0_diff": da0}
-            write_json(out / "reproduction.json", check)
-            log(f"[repro] same anchors={ident} max |a0 - stored|={check['a0_max_diff']}")
-            if not ident or max(da0) > a.a0_tol:
-                log("[repro] FAILED: the pool is not reproduced (GR00T or simulator not deterministic); nothing run")
-                return 4
-            with open(out / "anchor_snaps.pkl", "wb") as f:
-                pickle.dump([{"ep": b["ep"], "k": b["k"], "split": b["split"], "phase": b["phase"]["phase"],
-                              "snap": b["snap"], "a0": b["a0"]} for b in anchors], f)
+            check = {"mode": "fresh" if a.fresh else "reuse", "same_anchors": ident,
+                     "a0_max_diff": max(da0) if da0 else None, "a0_tol": a.a0_tol, "repro_tol": a.repro_tol,
+                     "per_anchor_a0_diff": da0, "methods": list(a.methods)}
+            write_json(out / "reproduction.json", dict(check, complete=False))
+            log(f"[repro] mode={check['mode']} same anchors (ep, sid, k, elapsed, split)={ident} "
+                f"max |a0 - stored|={check['a0_max_diff']}")
+            if not ident:
+                return fail(check, "different anchors (pool not reproduced)")
+            if not a.fresh and max(da0) > a.a0_tol:
+                return fail(check, f"GR00T proposals differ from the stored ones by {max(da0):.1e} > {a.a0_tol}; "
+                                   "use --fresh for a self-contained comparison")
+            snaps(anchors, verified=False)
 
             # ---- branches
             mi_sel = [methods_all.index(m) for m in a.methods]
-            E, QP, QV, KEY, rep = [], [], [], [], {}
+            E, ER, QP, QV, KEY, rep, fixed_dev = [], [], [], [], [], {}, {}
             for i in vmeta["heldout_idx"]:
                 b = anchors[i]
                 cont_seed = derive_seed("jacdiag-cont", a.task_id, b["ep"], b["k"])
-                nom, _ = fx.execute(task, b["snap"], b["a0"], restore, measure)
-                c0 = prov.propose(task.policy_observation(), None, cont_seed).a0_env.copy()
+                a0 = b["a0"] if a.fresh else S["a0"][i]  # reuse: the stored proposal, exactly as in the validation
+                nom, _ = fx.execute(task, b["snap"], a0, restore, measure)
+                c0 = prov.propose(task.policy_observation(), None, cont_seed).a0_env.copy()  # nominal continuation
                 for x in c0:
                     task.step(x)
                     nom.append(measure(task))
@@ -125,26 +155,39 @@ def collect(cfg, a, src, out):
                         if ii == i and mi in mi_sel and (i, methods_all[mi], int(d), int(s)) in S["ok"]]
                 for n_r, r in enumerate(rows):
                     act = S["raw_act"][r]
-                    if n_r == 0:  # reproduction of the saved re-planned branch
-                        st, _ = fx.execute(task, b["snap"], act, restore, measure)
-                        p = prov.propose(task.policy_observation(), None, cont_seed)
-                        for x in p.a0_env:
-                            task.step(x)
-                            st.append(measure(task))
-                        e = np.stack([fx.effect(u, v) for u, v in zip(st, nom)])
+                    if a.fresh:  # same executed correction, on top of the new proposal
+                        act = a0.copy()
+                        act[:, dims] = np.clip(a0[:, dims] + S["raw_act"][r][:, dims] - S["a0"][i][:, dims],
+                                               task.ACTION_LOW[dims], task.ACTION_HIGH[dims])
+                        ER.append(np.stack([fx.effect(u, v) for u, v in zip(branch(b, act, None, cont_seed), nom)]))
+                    elif n_r == 0:  # the saved re-planned branch must be reproduced exactly
+                        e = np.stack([fx.effect(u, v) for u, v in zip(branch(b, act, None, cont_seed), nom)])
                         rep[i] = float(np.abs(e - S["raw_e"][r]).max())
-                    st, _ = fx.execute(task, b["snap"], np.concatenate([act, c0]), restore, measure)
-                    E.append(np.stack([fx.effect(u, v) for u, v in zip(st, nom)]))
+                        if rep[i] > a.repro_tol:
+                            return fail(dict(check, replanned_max_diff=rep),
+                                        f"anchor {i}: re-planned branch differs from the saved one by {rep[i]:.1e}; "
+                                        "use --fresh for a self-contained comparison")
+                    st = branch(b, act, c0, cont_seed)
+                    e = np.stack([fx.effect(u, v) for u, v in zip(st, nom)])
+                    if not a.fresh:  # corrected chunk itself: identical to the saved validation branch
+                        fixed_dev[i] = max(fixed_dev.get(i, 0.0), float(np.abs(e[:C] - S["raw_e"][r][:C]).max()))
+                        if fixed_dev[i] > a.repro_tol:
+                            return fail(dict(check, replanned_max_diff=rep, fixed_first_C_max_diff=fixed_dev),
+                                        f"anchor {i}: corrected chunk differs from the saved one by {fixed_dev[i]:.1e}")
+                    E.append(e)
                     QP.append(st[C - 1]["qpos"] - nom[C - 1]["qpos"])
                     QV.append(st[C - 1]["qvel"] - nom[C - 1]["qvel"])
                     KEY.append(r)
                 counter.save()
-                np.savez_compressed(out / "continuation.npz", e_fixed=np.stack(E), dqpos_C=np.stack(QP), dqvel_C=np.stack(QV),
-                                    raw_row=np.array(KEY, int))
+                extra = {"e_replanned": np.stack(ER)} if a.fresh else {}
+                np.savez_compressed(out / "continuation.npz", e_fixed=np.stack(E), dqpos_C=np.stack(QP),
+                                    dqvel_C=np.stack(QV), raw_row=np.array(KEY, int), **extra)
                 log(f"[cont] anchor {i} phase={b['phase']['phase']} branches={len(rows)} "
-                    f"replanned repro max|de|={rep[i]:.1e} steps={counter.steps['diagnostic']}")
-            write_json(out / "reproduction.json", dict(check, replanned_max_diff=rep, complete=True,
-                                                       methods=list(a.methods)))
+                    + ("" if a.fresh else f"repro replanned={rep[i]:.1e} fixed[:C]={fixed_dev.get(i, 0.0):.1e} ")
+                    + f"steps={counter.steps['diagnostic']}")
+            write_json(out / "reproduction.json", dict(check, replanned_max_diff=rep, fixed_first_C_max_diff=fixed_dev,
+                                                       complete=True))
+            snaps(anchors, verified=not a.fresh)
     finally:
         counter.save()
         task.close()
@@ -165,7 +208,9 @@ def analyze(src: Path, out: Path) -> str:
     key = S["raw_key"][raw_row]
     methods = rp.get("methods") or [vmeta["methods"][m] for m in sorted(set(key[:, 1].tolist()))]
     norm = lambda e: np.linalg.norm(e[:, :, rows_eef] / sc[rows_eef][None, None], axis=2)  # noqa: E731
-    Z = {"fixed": norm(z["e_fixed"]), "replanned": norm(S["raw_e"][raw_row])}
+    # reuse mode: re-planned = the saved validation effects (verified on one branch per anchor);
+    # fresh mode: both protocols re-run from the same new snapshots
+    Z = {"fixed": norm(z["e_fixed"]), "replanned": norm(z["e_replanned"] if "e_replanned" in z else S["raw_e"][raw_row])}
     T = Z["fixed"].shape[1]
     qv = np.linalg.norm(z["dqvel_C"], axis=1)
     qp = np.linalg.norm(z["dqpos_C"], axis=1)
@@ -185,9 +230,13 @@ def analyze(src: Path, out: Path) -> str:
         return out
 
     L = ["# Fixed vs re-planned continuation", "",
-         f"complete: {rp.get('complete', False)}; anchors reproduced: {rp.get('same_anchors')}, "
-         f"max |a0 - stored| = {rp.get('a0_max_diff')}; re-planned branch reproduction max |de| per anchor: "
-         f"{ {k: float(f'{v:.1e}') for k, v in (rp.get('replanned_max_diff') or {}).items()} }",
+         f"mode: {rp.get('mode')}; complete: {rp.get('complete', False)}"
+         + (f"; FAILED: {rp['failed']}" if rp.get("failed") else "")
+         + f"; anchors reproduced (ep, sid, k, elapsed, split): {rp.get('same_anchors')}, "
+         f"max |a0 - stored| = {rp.get('a0_max_diff')}; tolerance {rp.get('repro_tol')}",
+         f"reproduction max |de| per anchor: re-planned branch "
+         f"{ {k: float(f'{v:.1e}') for k, v in (rp.get('replanned_max_diff') or {}).items()} }, "
+         f"corrected chunk (all branches) { {k: float(f'{v:.1e}') for k, v in (rp.get('fixed_first_C_max_diff') or {}).items()} }",
          f"branches: {len(raw_row)}. Normalised eef drift, mean over an anchor's draws, then median over anchors.", ""]
     phases = ["all"] + [p for p in ("grasp", "contact", "near", "free", "unknown") if p in set(phase[int(i)] for i in key[:, 0])]
     for ph in phases:
@@ -211,6 +260,15 @@ def analyze(src: Path, out: Path) -> str:
                 md = np.median(list(f.values()), axis=0)
                 L.append(f"{m:<12} " + " ".join(f"{x:5.2f}" + ("|" if t == C else "") for t, x in enumerate(md, 1)))
         L.append("```")
+        L += ["", "re-planned vs fixed, per anchor d_i = log(mean drift replanned / mean drift fixed) at s=2C over the same",
+              "branches (<0: GR00T re-planning reduces the deviation, >0: increases it)", "",
+              "| method | anchors | median d | d<0 | d>0 | min d | max d |", "|---|---|---|---|---|---|---|"]
+        for m in methods:
+            f, r = anchor_means(Z["fixed"], m, ph), anchor_means(Z["replanned"], m, ph)
+            d = [float(np.log(max(r[i][T - 1], 1e-12) / max(f[i][T - 1], 1e-12))) for i in f if i in r]
+            if d:
+                L.append(f"| {m} | {len(d)} | {np.median(d):.2f} | {sum(x < 0 for x in d)} | {sum(x > 0 for x in d)} | "
+                         f"{min(d):.2f} | {max(d):.2f} |")
         if "local_eef" in methods:
             L += ["", "local_eef vs method at s=2C: median dlog (<0 = local smaller), local smaller on k/n anchors", "",
                   "| vs | fixed dlog | fixed k/n | replanned dlog | replanned k/n |", "|---|---|---|---|---|"]
@@ -238,6 +296,11 @@ def main():
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--methods", nargs="*", default=["dct", "lag", "global_gram", "local_eef"])
     p.add_argument("--a0-tol", type=float, default=1e-4, help="max |a0 - stored a0| for the pool to count as reproduced")
+    p.add_argument("--repro-tol", type=float, default=1e-5,
+                   help="max |effect - saved effect| (m / rad) of re-executed validation branches (reuse mode)")
+    p.add_argument("--fresh", action="store_true",
+                   help="do not reuse the saved re-planned effects: run both protocols from the new snapshots "
+                        "(same executed corrections added to the new proposals); for when reproduction fails")
     p.add_argument("--step-limit", type=int, default=12000)
     p.add_argument("--analyze-only", action="store_true")
     p.add_argument("--force", action="store_true")

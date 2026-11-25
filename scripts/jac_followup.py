@@ -16,8 +16,9 @@ anchors. Everything overall and per phase.
   4. local_eef vs each method on common draws: median dlog drift at s=C and s=2C (<0 = local
      smaller) and the number of anchors where local is smaller;
   5. linear prediction of the executed corrections: e_hat_s = J_s(anchor) @ delta_actual and
-     with the global mean J of the fit anchors; rel. error ||e_hat - e|| / ||e|| per group at
-     s = C/2 and s = C.
+     with the global mean J of the fit anchors, per group at s = C/2 and s = C: absolute error
+     (mm / mrad), relative error pooled over interventions, and the number of near-zero true
+     effects (per-intervention relative errors explode there: local_eef minimises the end effect).
 
   python scripts/jac_followup.py [--dir runs/diagnostics/jacobian_task0]
 """
@@ -33,6 +34,7 @@ import numpy as np
 from flow_residual_rl import effects as fx
 
 PHASES = ("all", "grasp", "contact", "near", "free", "unknown")
+TINY = {"pos": 1e-4, "rot": 1e-3}  # m, rad
 
 
 def load(d: Path) -> dict:
@@ -142,42 +144,38 @@ def main():
                 print(f"{m:<12} {np.median(dC):9.2f} {sum(x < 0 for x in dC):>3}/{n:<2} "
                       f"{np.median(d2):10.2f} {sum(x < 0 for x in d2):>3}/{n:<2}")
 
-        print("\n5. linear prediction of executed corrections, rel. error ||J delta - e|| / ||e|| (median over anchors)")
+        print("\n5. linear prediction of executed corrections e_hat_s = J_s delta_actual: local J (anchor) / global mean J (fit)")
+        print("   abs = |e_hat - e| (median over anchors of the anchor mean; mm or mrad); pooled = sqrt(sum|e_hat-e|^2 / sum|e|^2)")
+        print(f"   over interventions; tiny = true effect below {TINY['pos'] * 1e3:g} mm / {TINY['rot'] * 1e3:g} mrad "
+              "(relative errors are unstable there: local_eef minimises the end effect on purpose)")
         groups = [g for g in ("eef_pos", "eef_rot", "obj_pos_task") if G.get(g)]
         Jbar = np.nanmean(np.stack([D["J"][i] for i in vmeta["fit_idx"]]), axis=0)
         steps = sorted({max(1, C // 2), C})
-        print(f"{'method':<12} " + " ".join(f"{g + ' s=' + str(s) + ' loc/glob':>26}" for g in groups for s in steps))
+        print(f"{'method':<12} {'group':<13} " + " ".join(f"{'s=' + str(s) + ' abs loc/glob':>20} {'pooled loc/glob':>16} {'tiny':>7}"
+                                                     for s in steps))
         for mi, m in enumerate(methods):
-            sel = key[:, 1] == mi
-            if not sel.any():
+            rows_m = [r for r in np.where(key[:, 1] == mi)[0] if ph == "all" or D["phase"][int(key[r, 0])] == ph]
+            if not rows_m:
                 continue
-            cells = []
             for g in groups:
                 r = G[g]
+                thr = TINY["rot"] if g.endswith("rot") else TINY["pos"]
+                cells = []
                 for s in steps:
-                    el, eg = [], []
-                    for row in np.where(sel)[0]:
+                    by, num_l, num_g, den, tiny_n = {}, 0.0, 0.0, 0.0, 0
+                    for row in rows_m:
                         i = int(key[row, 0])
-                        if ph != "all" and D["phase"][i] != ph:
-                            continue
                         d = dlt[row].reshape(-1)
                         e = eff[row, s - 1, r]
-                        ne = np.linalg.norm(e)
-                        el.append((i, np.linalg.norm(D["J"][i][s - 1][r] @ d - e) / max(ne, 1e-12) if ne > 0 else np.nan))
-                        eg.append((i, np.linalg.norm(Jbar[s - 1][r] @ d - e) / max(ne, 1e-12) if ne > 0 else np.nan))
-                    agg = []
-                    for lst in (el, eg):
-                        by = {}
-                        for i, v in lst:
-                            by.setdefault(i, []).append(v)
-                        vals = [np.nanmean(v) for v in by.values() if np.isfinite(v).any()]
-                        agg.append(np.median(vals) if vals else np.nan)
-                    cells.append(f"{agg[0]:12.2f} / {agg[1]:<11.2f}")
-            print(f"{m:<12} " + " ".join(cells))
-        tiny = (np.abs(eff[:, C - 1, G["obj_pos_task"]]).max(axis=1) < 1e-6).mean() if G.get("obj_pos_task") else 0
-        if ph == "all" and tiny:
-            print(f"   note: {tiny:.0%} of interventions move no task object at s=C (obj_pos_task error undefined there, skipped)")
-
+                        el = np.linalg.norm(D["J"][i][s - 1][r] @ d - e)
+                        eg = np.linalg.norm(Jbar[s - 1][r] @ d - e)
+                        by.setdefault(i, []).append((el, eg))
+                        num_l, num_g, den = num_l + el ** 2, num_g + eg ** 2, den + float(e @ e)
+                        tiny_n += np.linalg.norm(e) < thr
+                    al, ag = (np.median([np.mean([v[k] for v in vs]) for vs in by.values()]) * 1e3 for k in (0, 1))
+                    pl, pg = (np.sqrt(x / den) if den > 0 else float("nan") for x in (num_l, num_g))
+                    cells.append(f"{al:9.3f} / {ag:<8.3f} {pl:7.2f} / {pg:<6.2f} {tiny_n:>3}/{len(rows_m):<3}")
+                print(f"{m:<12} {g:<13} " + " ".join(cells))
 
 if __name__ == "__main__":
     main()
