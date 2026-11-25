@@ -86,6 +86,8 @@ No new bank / RL before these two diagnostics:
 python scripts/jacobian_diag.py --config configs/pilot.yaml --task-id 0   # ~26k env steps, real sim
 python scripts/jacobian_diag.py --config configs/pilot.yaml --task-id 0 --analyze-only   # re-run the analysis offline
 python scripts/profile_sac.py  --config configs/pilot.yaml                 # SAC update cost vs torch threads, no sim
+python scripts/jac_followup.py                                         # offline: energy / drift profiles, J*delta check
+python scripts/continuation_diag.py --config configs/pilot.yaml --task-id 0   # fixed vs re-planned continuation, ~6k steps
 ```
 `jacobian_diag` measures central-difference Jacobians of the physical effect (eef pose via relative rotations,
 gripper, every object pose) after s = 1..8 steps on phase-stratified anchors, compares integrator / fixed-lag /
@@ -130,7 +132,7 @@ src/flow_residual_rl/
   stages.py           bank / basis / eval / cell logic shared by scripts
   budget.py           env-step accounting (cost.json, hard limits)
   report.py           tables, curves, cost, Stage-A decision
-scripts/{smoke,eval_base,collect_bank,train_basis,run_pilot,jacobian_diag,profile_sac}.py
+scripts/{smoke,eval_base,collect_bank,train_basis,run_pilot,jacobian_diag,jac_followup,continuation_diag,profile_sac}.py
 docker/               V100 image (cu126 torch, no flash-attn)
 runs/<suite>_task<id>/{splits.json, bank/, basis/, base_eval/, cells/<arm>_seed<s>/}
 ```
