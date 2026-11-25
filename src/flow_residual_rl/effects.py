@@ -148,8 +148,13 @@ def phase_label(task, phys: dict, near_m: float = 0.08) -> dict:
 
 
 def flag_changes(a: dict, b: dict) -> dict:
-    """Objects whose grasp / contact flag differs between two flag sets."""
-    return {k: sorted(n for n in a[k] if a[k].get(n) != b[k].get(n)) for k in ("grasp", "contact")}
+    """Objects whose grasp / contact flag differs between two flag sets. A None (failed check) on
+    either side is a measurement gap, listed under 'unavailable', never counted as a change."""
+    out = {k: sorted(n for n in a[k] if a[k].get(n) is not None and b[k].get(n) is not None and a[k][n] != b[k][n])
+           for k in ("grasp", "contact")}
+    out["unavailable"] = sorted({f"{k}:{n}" for k in ("grasp", "contact") for n in a[k]
+                                 if a[k].get(n) is None or b[k].get(n) is None})
+    return out
 
 
 # ----------------------------------------------------------------------------- measurement
@@ -286,8 +291,10 @@ def pooled_errors(J_pred, J_trues, rows, step: int) -> dict:
     and the absolute RMS error per matrix entry (in the units of the rows)."""
     parts = [_err_parts(J_pred, J, rows, step) for J in J_trues]
     num, den, n = (sum(p[i] for p in parts) for i in range(3))
+    if n == 0:  # nothing measured: no estimate (not a perfect one)
+        return {"pooled_rel": None, "abs_rms": None, "true_rms": None, "n_entries": 0}
     return {"pooled_rel": (float(np.sqrt(num / den)) if den > 0 else (0.0 if num == 0 else float("inf"))),
-            "abs_rms": float(np.sqrt(num / n)) if n else None, "true_rms": float(np.sqrt(den / n)) if n else None}
+            "abs_rms": float(np.sqrt(num / n)), "true_rms": float(np.sqrt(den / n)), "n_entries": int(n)}
 
 
 # ----------------------------------------------------------------------------- bases

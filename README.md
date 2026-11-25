@@ -93,8 +93,8 @@ global models on held-out episodes, and validates DCT / model / local-oracle sha
 interventions plus one GR00T continuation chunk, overall and per interaction phase. Restore is checked against
 the original pool execution; finite differences are symmetric (one-sided only at a bound, flagged); validation
 directions are one common random vector projected onto each method's subspace. Raw effects, actions, context and
-proprio are kept. Output: `runs/diagnostics/jacobian_task<id>/analysis.md`; exit code 2 = validation incomplete
-(the report then says so and is not a result).
+proprio are kept. Output: `runs/diagnostics/jacobian_task<id>/analysis.md`; exit code 2 = validation incomplete,
+3 = complete but no comparable interventions (the report then says so and is not a result).
 
 ## Decisions taken from the actual sources (recorded in the resolved config / manifest)
 

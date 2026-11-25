@@ -20,7 +20,9 @@
    Recorded: eef / gripper / task-object / other-object effects, grasp/contact flag changes,
    success step, actual RMS (comparable iff >= 0.95 planned), raw effects and actions.
 6. analysis.json / analysis.md, also per phase; --analyze-only re-runs it offline and refuses
-   to call an incomplete validation complete (exit code 2).
+   to call an incomplete validation complete (exit code 2); exit code 3 if it is complete but has no
+   comparable interventions (insufficient signal). Paired comparisons use only (dir, sign) draws
+   usable for both methods; exact ties are counted separately from dominance.
 
 Every env.step is charged to the `diagnostic` bucket (hard limit --step-limit) and the run is in
 the project wall-time ledger. Output: runs/diagnostics/jacobian_task<id>/
@@ -178,7 +180,8 @@ def _collect(cfg, a, out, counter, prov, task, restore_to, task_splits, write_ma
             b.update(fd_one_sided=info["n_one_sided"], fd_unmeasured=info["n_unmeasured"],
                      fd_causality_max=info["causality_max"],
                      fd_branches_with_success=int(sum(x > 0 for x in info["branch_success_steps"])),
-                     fd_branches=len(info["branch_success_steps"]))
+                     fd_branches=len(info["branch_success_steps"]),
+                     fd_branch_success_steps=[int(x) for x in info["branch_success_steps"]])
             Js.append(J)
             fd.append(info)
             if b["split"] == "fit" and len(half_idx) < a.eta_check_anchors:
@@ -270,12 +273,15 @@ def _validation(recs, vmeta, anchors):
     stray = sorted({r["anchor"] for r in recs if r["anchor"] not in ho})
     recs = [r for r in recs if r["anchor"] in ho]
     expected = {(i, m, d, s) for i in ho for m in vmeta["methods"] for d in range(vmeta["val_dirs"]) for s in vmeta["signs"]}
-    present = {(r["anchor"], r["method"], r["dir"], r["sign"]) for r in recs}
+    keys_seen = [(r["anchor"], r["method"], r["dir"], r["sign"]) for r in recs]
+    present = set(keys_seen)
+    duplicates = len(keys_seen) - len(present)
     missing = sorted(expected - present)
     used = [r for r in recs if "skipped" not in r and r.get("comparable")]
     per = {}
     for r in used:
         per.setdefault((r["anchor"], r["method"]), []).append(r)
+    by_key = {(r["anchor"], r["method"], r["dir"], r["sign"]): r for r in used}
     keys = ("endpoint_drift", "shape_change", "drift_after_continuation", "obj_pos_task_absmax_end",
             "obj_pos_task_absmax_cont", "obj_pos_other_absmax_end", "obj_pos_other_absmax_cont", "grip_absmax_end",
             "eef_pos_m_end", "rms_actual")
@@ -287,6 +293,7 @@ def _validation(recs, vmeta, anchors):
             rs = [r for i in idx for r in per.get((i, m), [])]
             rows["frac_grasp_changed_cont"] = float(np.mean([bool(r["changed_cont"]["grasp"]) for r in rs])) if rs else None
             rows["frac_contact_changed_cont"] = float(np.mean([bool(r["changed_cont"]["contact"]) for r in rs])) if rs else None
+            rows["n_flag_unavailable"] = sum(bool(r["changed_cont"].get("unavailable")) for r in rs)
             rows["frac_success_in_window"] = float(np.mean([r["success_step"] > 0 for r in rs])) if rs else None
             rows["n_anchors"] = sum((i, m) in per for i in idx)
             t[m] = rows
@@ -298,16 +305,24 @@ def _validation(recs, vmeta, anchors):
             for m in vmeta["methods"]:
                 if m in LOCAL:
                     continue
-                de, ds, dom = [], [], 0
+                de, ds, dom, ties, n_pairs = [], [], 0, 0, 0
                 for i in idx:
-                    if (i, loc) in per and (i, m) in per:
-                        e_l, e_m = (np.mean([r["endpoint_drift"] for r in per[(i, x)]]) for x in (loc, m))
-                        s_l, s_m = (np.mean([r["shape_change"] for r in per[(i, x)]]) for x in (loc, m))
-                        de.append(float(np.log(max(e_l, 1e-12) / max(e_m, 1e-12))))
-                        ds.append(float(np.log(max(s_l, 1e-12) / max(s_m, 1e-12))))
-                        dom += int(s_l >= s_m and e_l <= e_m)
-                out[f"{loc}_vs_{m}"] = {"n_anchors": len(de), "median_dlog_endpoint": _med(de),
-                                        "median_dlog_shape": _med(ds), "local_dominates": dom}
+                    # only (dir, sign) draws usable for BOTH methods: clipping exclusions must not bias the pair
+                    common = [(d, s) for d in range(vmeta["val_dirs"]) for s in vmeta["signs"]
+                              if (i, loc, d, s) in by_key and (i, m, d, s) in by_key]
+                    if not common:
+                        continue
+                    n_pairs += len(common)
+                    e_l, e_m = (np.mean([by_key[(i, x, d, s)]["endpoint_drift"] for d, s in common]) for x in (loc, m))
+                    s_l, s_m = (np.mean([by_key[(i, x, d, s)]["shape_change"] for d, s in common]) for x in (loc, m))
+                    de.append(float(np.log(max(e_l, 1e-12) / max(e_m, 1e-12))))
+                    ds.append(float(np.log(max(s_l, 1e-12) / max(s_m, 1e-12))))
+                    if np.isclose(s_l, s_m, rtol=1e-9, atol=0) and np.isclose(e_l, e_m, rtol=1e-9, atol=0):
+                        ties += 1
+                    elif s_l >= s_m and e_l <= e_m:
+                        dom += 1  # at least as good on both and strictly better on one
+                out[f"{loc}_vs_{m}"] = {"n_anchors": len(de), "n_pairs": n_pairs, "median_dlog_endpoint": _med(de),
+                                        "median_dlog_shape": _med(ds), "local_dominates": dom, "ties": ties}
         return out
 
     idx_all = sorted(ho)
@@ -317,7 +332,10 @@ def _validation(recs, vmeta, anchors):
         if idx:
             by_phase[ph] = {"n_anchors": len(idx), "n_episodes": len({anchors[i]["ep"] for i in idx}),
                             "table": table(idx), "paired": paired(idx)}
-    return {"complete": bool(vmeta.get("complete")) and not missing and not stray, "n_records": len(recs),
+    complete = bool(vmeta.get("complete")) and not missing and not stray and not duplicates
+    return {"complete": complete, "duplicates": duplicates,
+            "sufficient": bool(ho) and len(used) > 0,  # complete AND something comparable to conclude from
+            "n_records": len(recs),
             "n_used": len(used), "n_noncomparable": sum(1 for r in recs if "skipped" not in r and not r.get("comparable")),
             "n_skipped": sum(1 for r in recs if "skipped" in r), "missing": [list(x) for x in missing[:20]],
             "n_missing": len(missing), "stray_anchors": stray, "overall": {"table": table(idx_all), "paired": paired(idx_all)},
@@ -340,7 +358,6 @@ def analyze(out: Path, repeat_tol: float) -> dict:
         ho_i = [i for i, b in enumerate(anchors) if b["split"] == "heldout" and b["repeat_max"] <= tol]
         sc = fx.group_scales([J_all[i] for i in fit_i], layout)
     fitn = [fx.normalise(J_all[i], sc) for i in fit_i]
-    hon = {i: fx.normalise(J_all[i], sc) for i in ho_i}
     eps = lambda idx: {ph: {"anchors": sum(anchors[i]["phase"]["phase"] == ph for i in idx),  # noqa: E731
                             "episodes": len({anchors[i]["ep"] for i in idx if anchors[i]["phase"]["phase"] == ph})}
                        for ph in PHASES}
@@ -369,10 +386,12 @@ def analyze(out: Path, repeat_tol: float) -> dict:
     preds = {"integrator": fx.integrator_J(fx.fit_integrator(fitn, nd), C), "lag": fx.lag_J(fx.fit_lag(fitn, nd)),
              "global_mean": np.nanmean(np.stack(fitn), axis=0)}
     groups = [g for g in ("eef_pos", "eef_rot", "grip", "obj_pos_task", "obj_pos_other") if G[g]]
-    res["heldout_error"] = {m: {g: {f"s{s}": fx.pooled_errors(Jp, list(hon.values()), G[g], s - 1) for s in (2, 4, 6, 8)}
-                                for g in groups} for m, Jp in preds.items()}
+    raw = {m: Jp * sc[None, :, None] for m, Jp in preds.items()}  # back to raw units (m, rad per unit command)
+    hor = {i: J_all[i] for i in ho_i}
+    res["heldout_error"] = {m: {g: {f"s{s}": fx.pooled_errors(Jp, list(hor.values()), G[g], s - 1) for s in (2, 4, 6, 8)}
+                                for g in groups} for m, Jp in raw.items()}
     res["heldout_error_by_phase"] = {
-        ph: {g: fx.pooled_errors(preds["global_mean"], [hon[i] for i in ho_i if anchors[i]["phase"]["phase"] == ph],
+        ph: {g: fx.pooled_errors(raw["global_mean"], [hor[i] for i in ho_i if anchors[i]["phase"]["phase"] == ph],
                                  G[g], C - 1) for g in groups}
         for ph in PHASES if any(anchors[i]["phase"]["phase"] == ph for i in ho_i)}
 
@@ -439,17 +458,22 @@ def _val_table(t):
 
 
 def _paired(p):
-    return ["| comparison | n | median dlog endpoint (<0 better) | median dlog shape (>0 better) | local dominates |",
-            "|---|---|---|---|---|"] + [f"| {k} | {v['n_anchors']} | {_f(v['median_dlog_endpoint'])} | "
-                                        f"{_f(v['median_dlog_shape'])} | {v['local_dominates']} |" for k, v in p.items()]
+    return ["| comparison | anchors / paired draws | median dlog endpoint (<0 better) | median dlog shape (>0 better) "
+            "| local dominates | ties |", "|---|---|---|---|---|---|"] + [
+        f"| {k}{' (exploratory: object features)' if k.startswith('local_full') else ''} | {v['n_anchors']} / {v['n_pairs']} | "
+        f"{_f(v['median_dlog_endpoint'])} | {_f(v['median_dlog_shape'])} | {v['local_dominates']} | {v['ties']} |"
+        for k, v in p.items()]
 
 
 def render_md(r: dict) -> str:
     L = ["# Jacobian diagnostic\n"]
     v = r.get("validation")
     if v is not None and not v["complete"]:
-        L.append(f"**INCOMPLETE VALIDATION: {v['n_missing']} missing intervention(s), stray anchors {v['stray_anchors']}. "
-                 f"Not a result.**\n")
+        L.append(f"**INCOMPLETE VALIDATION: {v['n_missing']} missing intervention(s), {v['duplicates']} duplicate(s), "
+                 f"stray anchors {v['stray_anchors']}. Not a result.**\n")
+    elif v is not None and not v["sufficient"]:
+        L.append(f"**INSUFFICIENT SIGNAL: {r['n_heldout']} valid held-out anchors, {v['n_used']} comparable interventions. "
+                 f"No conclusion can be drawn.**\n")
     L += [f"anchors: {r['n_anchors']} (fit {r['n_fit']}, held-out {r['n_heldout']}); excluded by restore (tol {r['repeat_tol']}): "
           f"{r['excluded_restore']}. {r['repeat_tol_note'] or ''}",
           f"restore vs original pool execution: max {r['restore_vs_orig_max']:.1e}; restore repeat: max {r['restore_repeat_max']:.1e}",
@@ -463,7 +487,8 @@ def render_md(r: dict) -> str:
           "Mixes nonlinearity, finite-difference error and noise; small = the linear model is meaningful at this amplitude.\n"]
     for g, x in r["eta_half_rel_diff"].items():
         L.append(f"- {g}: " + ", ".join(f"{k}={_f(y)}" for k, y in x.items()))
-    L.append("\n## 2. Held-out error of state-independent models (pooled rel. error | abs RMS error / true RMS, raw units)\n")
+    L.append("\n## 2. Held-out error of state-independent models (pooled rel. error (abs RMS error / true RMS per Jacobian "
+             "entry, raw units: m or rad per unit command))\n")
     L.append("| model | group | s=2 | s=4 | s=6 | s=8 |\n|---|---|---|---|---|---|")
     for m, gs in r["heldout_error"].items():
         for g, x in gs.items():
@@ -532,6 +557,8 @@ def main():
     print((out / "analysis.md").read_text())
     if "validation" not in r or not r["validation"]["complete"]:
         sys.exit(2)
+    if not r["validation"]["sufficient"]:
+        sys.exit(3)
 
 
 if __name__ == "__main__":

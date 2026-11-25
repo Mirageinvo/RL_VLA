@@ -240,3 +240,65 @@ def test_offline_analysis_flags_incomplete_validation(tmp_path):
     r = jd.analyze(tmp_path, 1e-6)
     assert not r["validation"]["complete"] and r["validation"]["n_missing"] == 1
     assert "INCOMPLETE VALIDATION" in (tmp_path / "analysis.md").read_text()
+
+
+def test_flag_changes_ignore_failed_checks():
+    a = {"grasp": {"x": None, "y": True}, "contact": {"x": False, "y": True}}
+    b = {"grasp": {"x": False, "y": False}, "contact": {"x": False, "y": None}}
+    c = fx.flag_changes(a, b)
+    assert c["grasp"] == ["y"] and c["contact"] == [] and c["unavailable"] == ["contact:y", "grasp:x"]
+
+
+def test_pooled_errors_without_measurements_is_no_estimate():
+    J = np.full((C, 3, 48), np.nan)
+    assert fx.pooled_errors(np.zeros((C, 3, 48)), [J], [0, 1, 2], C - 1)["pooled_rel"] is None
+
+
+def _recs(tmp_path):
+    return [json.loads(l) for l in open(tmp_path / "validation.jsonl")]
+
+
+def _write(tmp_path, recs):
+    with open(tmp_path / "validation.jsonl", "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_paired_comparison_uses_common_draws_only(tmp_path):
+    """Review counterexample: identical effects on common draws, some draws excluded only for the oracle."""
+    jd = _load_script()
+    _synthetic_out(tmp_path, jd)
+    vm = json.loads((tmp_path / "validation_meta.json").read_text())
+    vm["val_dirs"] = 2
+    (tmp_path / "validation_meta.json").write_text(json.dumps(vm))
+    recs = []
+    for r in _recs(tmp_path):
+        for d, (e, s_) in enumerate(((0.2, 1.0), (1.0, 0.1))):  # draw 1 is bad for everybody
+            recs.append(dict(r, dir=d, endpoint_drift=e, shape_change=s_))
+    for r in recs:
+        if r["method"] in jd.LOCAL and r["dir"] == 1:
+            r["comparable"] = False  # clipped only for the oracle
+    _write(tmp_path, recs)
+    p = jd.analyze(tmp_path, 1e-6)["validation"]["overall"]["paired"]["local_eef_vs_dct"]
+    assert p["median_dlog_endpoint"] == 0.0 and p["median_dlog_shape"] == 0.0
+    assert p["local_dominates"] == 0 and p["ties"] == p["n_anchors"] == 2
+
+
+def test_duplicates_and_insufficient_signal(tmp_path):
+    jd = _load_script()
+    _synthetic_out(tmp_path, jd)
+    recs = _recs(tmp_path)
+    _write(tmp_path, recs + recs[:1])
+    v = jd.analyze(tmp_path, 1e-6)["validation"]
+    assert not v["complete"] and v["duplicates"] == 1
+    _write(tmp_path, [dict(r, comparable=False) for r in recs])
+    v = jd.analyze(tmp_path, 1e-6)["validation"]
+    assert v["complete"] and not v["sufficient"] and v["n_used"] == 0
+    assert "INSUFFICIENT SIGNAL" in (tmp_path / "analysis.md").read_text()
+
+
+def test_no_valid_heldout_anchor_is_insufficient(tmp_path):
+    jd = _load_script()
+    _synthetic_out(tmp_path, jd, repeat=(0.0, 1.0, 0.0, 1.0))
+    v = jd.analyze(tmp_path, 1e-6)["validation"]
+    assert not v["sufficient"]
