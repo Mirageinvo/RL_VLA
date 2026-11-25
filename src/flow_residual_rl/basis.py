@@ -46,7 +46,7 @@ def warmup_latent(rng: np.random.Generator, d: int, radius: tuple[float, float],
     linear: r * (uniform random sign vector, a cube corner)  -> ||w|| = r*sqrt(d)/sqrt(d) = r
     (inside the cube, ||w|| = r for r close to 1 is reachable only near the corners).
     """
-    r = rng.uniform(*radius, size=(n, 1))
+    # draw order (direction, then radius) is the Stage A v1 order: radial warmup is bit-identical to v1
     if latent_map == "radial":
         v = rng.standard_normal((n, d))
         v /= np.linalg.norm(v, axis=1, keepdims=True)
@@ -54,6 +54,7 @@ def warmup_latent(rng: np.random.Generator, d: int, radius: tuple[float, float],
         v = rng.choice(np.array([-1.0, 1.0]), size=(n, d))
     else:
         raise ValueError(f"latent_map must be one of {LATENT_MAPS}, got {latent_map!r}")
+    r = rng.uniform(*radius, size=(n, 1))
     return (v * r).astype(np.float32)
 
 

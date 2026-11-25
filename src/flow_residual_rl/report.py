@@ -268,6 +268,9 @@ def main():
             f = tdir / sub / "cost.json"
             if f.exists():
                 cost[f"{tdir.name}/{sub}"] = json.loads(f.read_text())
+    for f in sorted(runs.glob("diagnostics/*/cost.json")) + [runs / "smoke" / "cost.json"]:
+        if f.exists():  # diagnostics and smoke are project cost too
+            cost[str(f.parent.relative_to(runs))] = json.loads(f.read_text())
     tot = {}
     for v in cost.values():
         for vv in (v.values() if isinstance(v, dict) and "steps" not in v else [v]):

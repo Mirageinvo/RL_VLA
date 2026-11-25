@@ -90,7 +90,11 @@ python scripts/profile_sac.py  --config configs/pilot.yaml                 # SAC
 `jacobian_diag` measures central-difference Jacobians of the physical effect (eef pose via relative rotations,
 gripper, every object pose) after s = 1..8 steps on phase-stratified anchors, compares integrator / fixed-lag /
 global models on held-out episodes, and validates DCT / model / local-oracle shape subspaces with real
-interventions plus one GR00T continuation chunk. Output: `runs/diagnostics/jacobian_task<id>/analysis.md`.
+interventions plus one GR00T continuation chunk, overall and per interaction phase. Restore is checked against
+the original pool execution; finite differences are symmetric (one-sided only at a bound, flagged); validation
+directions are one common random vector projected onto each method's subspace. Raw effects, actions, context and
+proprio are kept. Output: `runs/diagnostics/jacobian_task<id>/analysis.md`; exit code 2 = validation incomplete
+(the report then says so and is not a result).
 
 ## Decisions taken from the actual sources (recorded in the resolved config / manifest)
 

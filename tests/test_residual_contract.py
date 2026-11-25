@@ -58,13 +58,25 @@ def test_warmup_physical_rms_identical_across_ranks(latent_map):
 
     for name in ("random12", "full48"):
         rm = ResidualMap(bases()[name], C, tuple(range(6)), EPS, LO, HI, latent_map=latent_map)
-        rng = np.random.default_rng(0)
-        u = warmup_latent(rng, rm.dim, (0.25, 1.0), latent_map, n=400)
-        r = warmup_latent(np.random.default_rng(0), rm.dim, (0.25, 1.0), latent_map, n=400)
-        assert np.array_equal(u, r) and np.all(np.abs(u) <= 1.0)
+        u = warmup_latent(np.random.default_rng(0), rm.dim, (0.25, 1.0), latent_map, n=400)
+        assert np.array_equal(u, warmup_latent(np.random.default_rng(0), rm.dim, (0.25, 1.0), latent_map, n=400))
+        assert np.all(np.abs(u) <= 1.0)
+        radius = np.linalg.norm(u, axis=1) if latent_map == "radial" else np.abs(u[:, 0])
+        assert np.all((radius >= 0.25 - 1e-6) & (radius <= 1.0 + 1e-6))
         rms = np.array([np.sqrt(np.mean(rm.delta(x) ** 2)) for x in u])
-        radius = np.random.default_rng(0).uniform(0.25, 1.0, size=(400, 1))[:, 0]  # first draw of warmup_latent
-        np.testing.assert_allclose(rms, EPS * radius, rtol=1e-4)
+        np.testing.assert_allclose(rms, EPS * radius, rtol=1e-4)  # physical RMS = r * epsilon for every rank
+
+
+def test_radial_warmup_is_bit_identical_to_stage_a_v1():
+    """Stage A v1 drew the direction first, then the radius (ResidualSAC._sample_action before d2523ca)."""
+    from flow_residual_rl.basis import warmup_latent
+
+    for d in (12, 48):
+        rng = np.random.default_rng(5)
+        v = rng.standard_normal((1, d))
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+        old = (v * rng.uniform(0.25, 1.0, size=(1, 1))).astype(np.float32)
+        assert np.array_equal(warmup_latent(np.random.default_rng(5), d, (0.25, 1.0), "radial"), old)
 
 
 def test_zero_u_is_bit_exact_including_gripper():
