@@ -79,6 +79,14 @@ def test_paired_counts_and_schedule_check():
     assert (p["rescued"], p["harmed"], p["ref_failures"], p["ref_successes"]) == (1, 1, 2, 2)
     with pytest.raises(ValueError):
         rfp.paired(base, [dict(arm[0], key="other")] + arm[1:])
+    # incomplete evaluations with a matching prefix are rejected, not silently truncated
+    with pytest.raises(ValueError, match="incomplete"):
+        rfp.paired(base, arm[:3])
+    with pytest.raises(ValueError, match="incomplete"):
+        rfp.paired(base[:3], arm[:3], n_expected=4)
+    with pytest.raises(ValueError, match="incomplete"):
+        rfp.summarize(base, {"dct12": (arm, {}), "tail12": (arm[:3], {})}, 100, 4)
+    assert rfp.paired(base, arm, n_expected=4)["n"] == 4
 
 
 def test_run_fixed_pilot_end_to_end(tmp_path, monkeypatch):

@@ -32,10 +32,13 @@ from flow_residual_rl.config import base_parser, load_config, write_json
 from flow_residual_rl.pipeline import load_normalizer, make_provider, make_task, runs_dir, task_dir, task_splits, write_manifest
 
 
-def paired(base: list, arm: list) -> dict:
-    """Episode-by-episode comparison on the same evaluation schedule."""
-    n = min(len(base), len(arm))
-    for b, x in zip(base[:n], arm[:n]):
+def paired(base: list, arm: list, n_expected: int | None = None) -> dict:
+    """Episode-by-episode comparison on the same evaluation schedule. Both lists must be complete
+    (exactly n_expected records, or equal length) and agree on every (init_state_id, key)."""
+    n = len(base) if n_expected is None else n_expected
+    if len(base) != n or len(arm) != n:
+        raise ValueError(f"incomplete paired evaluation: {len(base)} reference vs {len(arm)} arm records, expected {n}")
+    for b, x in zip(base, arm):
         if (b["init_state_id"], b["key"]) != (x["init_state_id"], x["key"]):
             raise ValueError(f"episode schedules differ: {b['init_state_id'], b['key']} vs {x['init_state_id'], x['key']}")
     bs = np.array([bool(b["success"]) for b in base[:n]])
@@ -45,13 +48,13 @@ def paired(base: list, arm: list) -> dict:
             "ref_failures": int(np.sum(~bs)), "ref_successes": int(np.sum(bs))}
 
 
-def summarize(base_recs, arm_recs: dict, at_steps: int) -> dict:
+def summarize(base_recs, arm_recs: dict, at_steps: int, n_expected: int | None = None) -> dict:
     out = {"at_online_steps": at_steps, "arms": {}}
     for arm, (recs, summ) in arm_recs.items():
-        out["arms"][arm] = dict(paired(base_recs, recs), rms_median=summ.get("rms_median"),
+        out["arms"][arm] = dict(paired(base_recs, recs, n_expected), rms_median=summ.get("rms_median"),
                                 clip_mean=summ.get("clip_mean"), mean_length=summ.get("mean_length"))
     if "dct12" in arm_recs and "tail12" in arm_recs:
-        out["tail12_vs_dct12"] = paired(arm_recs["dct12"][0], arm_recs["tail12"][0])
+        out["tail12_vs_dct12"] = paired(arm_recs["dct12"][0], arm_recs["tail12"][0], n_expected)
     return out
 
 
@@ -132,7 +135,8 @@ def main():
     for arm in a.arms:
         f = cell_dir(cfg, tid, arm, seed) / "evals" / f"eval_{a.steps:07d}_n{a.eval_episodes}.json"
         arm_recs[arm] = (json.loads(f.read_text())["episodes"], summ[arm])
-    s = summarize(base_recs, arm_recs, a.steps)
+    # the cached base reference may hold more episodes of the same schedule; it must hold at least n
+    s = summarize(base_recs, arm_recs, a.steps, a.eval_episodes)
     s["base"] = {"n": len(base_recs), "sr": float(np.mean([r["success"] for r in base_recs]))}
     s.update(task_id=tid, seed=seed, arms_order=a.arms, block_steps=a.block_steps)
     write_json(tdir / "fixed_pilot_summary.json", s)

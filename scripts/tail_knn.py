@@ -14,8 +14,10 @@ eef rows, mean over the basis directions:
 Compared with global_tail (mean-Gram over all fit anchors) and lag_tail (fitted lag model);
 local_tail (the anchor's own J) is the oracle reference.
 
-Pre-registered pass (vs EACH control separately): in >= 2 held-out episodes the episode median of
-dlog(knn / control) is < 0 for pose AND for vel, and the episode median shape ratio is >= 0.9.
+Pre-registered pass (vs EACH control separately): knn_tail and the control have rank 6 (6 columns,
+numerically independent) at EVERY held-out anchor (the per-direction scores would otherwise reward a
+smaller basis), and in >= 2 held-out episodes the episode median of dlog(knn / control) is < 0 for
+pose AND for vel, and the episode median shape ratio is >= 0.9.
 Only then is knn_tail added to the 2C test on the saved snapshots (~2k sim steps).
 
   python scripts/tail_knn.py [--dir runs/diagnostics/jacobian_task0] [--k 3]
@@ -34,6 +36,7 @@ from flow_residual_rl import effects as fx
 
 SHAPE_STEPS = (2, 4, 6)
 CONTROLS = ("global_tail", "lag_tail")
+REQUIRED_RANK = 6  # every compared basis must span 6 directions at every held-out anchor
 METHODS = ("knn_tail",) + CONTROLS + ("local_tail",)
 
 
@@ -43,7 +46,8 @@ def scores(J, B, rows, C, nd):
     return {"pose": float(np.linalg.norm(Jr[C - 1] @ B) / np.sqrt(k)),
             "vel": float(np.linalg.norm((Jr[C - 1] - Jr[C - 2]) @ B) / np.sqrt(k)),
             "shape": float(np.sqrt(sum(np.linalg.norm(Jr[h - 1] @ B) ** 2 for h in SHAPE_STEPS)) / np.sqrt(k)),
-            "sum": float(np.linalg.norm(fx.sum_operator(C, nd) @ B)), "rank": int(B.shape[1])}
+            "sum": float(np.linalg.norm(fx.sum_operator(C, nd) @ B)), "rank": int(B.shape[1]),
+            "numerical_rank": int(np.linalg.matrix_rank(B, tol=1e-6)) if B.size else 0}
 
 
 def features(z, idx):
@@ -88,7 +92,12 @@ def run(d: Path, k: int) -> dict:
                         "dlog_vel": float(np.median([dl(r, ctrl, "vel") for r in rs])),
                         "shape_ratio": float(np.median([np.exp(dl(r, ctrl, "shape")) for r in rs]))}
         ok = [e for e, v in by_ep.items() if v["dlog_pose"] < 0 and v["dlog_vel"] < 0 and v["shape_ratio"] >= 0.9]
-        verdict[ctrl] = {"by_episode": by_ep, "episodes_passing": ok, "pass": len(ok) >= 2,
+        bad_rank = [{"anchor": r["anchor"], "method": m, "rank": r["scores"][m]["rank"],
+                     "numerical_rank": r["scores"][m]["numerical_rank"]}
+                    for r in per for m in ("knn_tail", ctrl)
+                    if min(r["scores"][m]["rank"], r["scores"][m]["numerical_rank"]) != REQUIRED_RANK]
+        verdict[ctrl] = {"by_episode": by_ep, "episodes_passing": ok, "rank_ok": not bad_rank, "rank_failures": bad_rank,
+                         "pass": len(ok) >= 2 and not bad_rank,
                          "overall_median_dlog_pose": float(np.median([dl(r, ctrl, "pose") for r in per])),
                          "overall_median_dlog_vel": float(np.median([dl(r, ctrl, "vel") for r in per])),
                          "overall_median_shape_ratio": float(np.median([np.exp(dl(r, ctrl, "shape")) for r in per]))}
@@ -109,7 +118,8 @@ def render(o) -> str:
     for m, v in o["medians"].items():
         L.append(f"| {m} | {v['pose']:.4f} | {v['vel']:.4f} | {v['shape']:.3f} | {v['sum']:.1e} |")
     for ctrl, v in o["verdict"].items():
-        L += ["", f"## knn_tail vs {ctrl}: {'PASS' if v['pass'] else 'fail'} (episodes passing {v['episodes_passing']})", "",
+        L += ["", f"## knn_tail vs {ctrl}: {'PASS' if v['pass'] else 'fail'} (episodes passing {v['episodes_passing']}, "
+                  f"rank {REQUIRED_RANK} everywhere: {'yes' if v['rank_ok'] else 'NO, ' + str(len(v['rank_failures'])) + ' failures'})", "",
               f"overall median dlog pose {v['overall_median_dlog_pose']:.2f}, vel {v['overall_median_dlog_vel']:.2f}, "
               f"shape ratio {v['overall_median_shape_ratio']:.2f}", "",
               "| episode | anchors | median dlog pose | median dlog vel | median shape ratio |", "|---|---|---|---|---|"]

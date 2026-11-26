@@ -44,3 +44,24 @@ def test_knn_without_state_dependence_does_not_pass(tmp_path):
     _write(tmp_path / "d", alphas, proprio, list(range(6)), [6, 7, 8, 9], [0, 0, 2, 2, 4, 4, 1, 1, 3, 3])
     o = tk.run(tmp_path / "d", 3)
     assert not o["pass"]  # identical dynamics everywhere: knn cannot beat the global basis
+
+
+def test_rank_deficient_knn_basis_cannot_pass(tmp_path, monkeypatch):
+    tk = _load("tail_knn")
+    alphas = [0.1] * 3 + [0.5] * 3 + [0.9] * 3 + [0.1, 0.9, 0.5, 0.1]
+    proprio = [[float(k)] * 8 for k in (0, 0, 0, 1, 1, 1, 2, 2, 2, 0, 2, 1, 0)]
+    eps = [0, 0, 0, 2, 2, 2, 4, 4, 4, 1, 1, 3, 3]
+    _write(tmp_path / "d", alphas, proprio, list(range(9)), [9, 10, 11, 12], eps)
+    orig = fx.tail_basis_mean
+
+    def one_column(Js, *a, **kw):  # the k=3 neighbour basis keeps a single direction
+        out = orig(Js, *a, **kw)
+        return dict(out, shape=out["shape"][:, :1]) if len(Js) == 3 else out
+
+    monkeypatch.setattr(tk.fx, "tail_basis_mean", one_column)
+    o = tk.run(tmp_path / "d", 3)
+    for ctrl in tk.CONTROLS:
+        v = o["verdict"][ctrl]
+        assert not v["rank_ok"] and not v["pass"]
+        assert {f["method"] for f in v["rank_failures"]} == {"knn_tail"} and len(v["rank_failures"]) == 4
+    assert not o["pass"]
