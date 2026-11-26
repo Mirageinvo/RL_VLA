@@ -70,6 +70,8 @@ def init_actor_heads(model: SAC, log_std_bias: float) -> None:
 
 
 def make_sac(env, cfg: dict, seed: int, smoke: bool = False) -> ResidualSAC:
+    if cfg.get("torch_threads"):  # CPU SAC: 32 default threads were ~3x slower per update than 4-8 (profile_sac.py)
+        torch.set_num_threads(int(cfg["torch_threads"]))
     d = env.action_space.shape[0]
     model = ResidualSAC(
         "MlpPolicy", env,

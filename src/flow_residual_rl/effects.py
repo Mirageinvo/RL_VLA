@@ -342,6 +342,38 @@ def oer_basis(Js, rows, end_step: int, shape_steps, k_end: int = 6, k_shape: int
             "rank_end": r_end, "rank_shape": r_sh, "n_unmeasured_cols": n_unmeasured}
 
 
+def sum_operator(C: int, nd: int) -> np.ndarray:
+    """[nd, C*nd] (row-major t*nd+k): per-coordinate sum of the commands over the chunk, / sqrt(C)."""
+    return np.kron(np.ones((1, C)), np.eye(nd)) / np.sqrt(C)
+
+
+def tail_basis(J, rows, shape_steps, nd: int, k_shape: int = 6, rel_tol: float = 1e-8) -> dict:
+    """Handoff-aware ("tail") OER from ONE normalised Jacobian J [C, F, N] (anchor, global mean or model).
+
+    Constraints on a correction d: zero command sum (S d = 0, the integrating controller's lasting
+    displacement), end pose J_C d = 0 and the last-step change (J_C - J_{C-1}) d = 0 (local velocity,
+    approximately). Shape: the k_shape directions of the remaining null space with the largest
+    intermediate response sum_h |J_h d|^2. Unmeasured entries count as zero (reported)."""
+    C, _, N = J.shape
+    n_unmeasured = int(np.isnan(J[:, rows, :]).any(axis=(0, 1)).sum())
+    Jr = np.nan_to_num(J[:, rows, :])
+    S = sum_operator(C, nd)
+    A = [Jr[C - 1], Jr[C - 1] - Jr[C - 2]]
+    # each block scaled to unit spectral norm: the rank decision must not depend on units
+    blocks = [S] + [a / np.linalg.norm(a, 2) for a in A if np.linalg.norm(a, 2) > 0]
+    M = np.vstack(blocks)
+    u, s, vt = np.linalg.svd(M, full_matrices=True)
+    r_c = int(np.sum(s > rel_tol * s.max()))
+    B_c = vt[:r_c].T  # constrained directions
+    Q = vt[r_c:].T  # null space
+    G_sh = sum(Jr[h - 1].T @ Jr[h - 1] for h in shape_steps)
+    w, v = _eig_desc(Q.T @ G_sh @ Q)
+    tol = rel_tol * max(float(w.max(initial=0)), 1e-300)
+    r_sh = int(min(k_shape, np.sum(w > tol)))
+    return {"end": B_c, "shape": Q @ v[:, :r_sh], "ev_shape": w[:k_shape], "rank_constraints": r_c,
+            "rank_shape": r_sh, "n_unmeasured_cols": n_unmeasured}
+
+
 def dct_oer(C: int, nd: int) -> dict:
     b = dct_basis(C, nd, 2).astype(np.float64)
     return {"end": b[:, :nd], "shape": b[:, nd:2 * nd], "rank_end": nd, "rank_shape": nd}

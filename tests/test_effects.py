@@ -302,3 +302,46 @@ def test_no_valid_heldout_anchor_is_insufficient(tmp_path):
     _synthetic_out(tmp_path, jd, repeat=(0.0, 1.0, 0.0, 1.0))
     v = jd.analyze(tmp_path, 1e-6)["validation"]
     assert not v["sufficient"]
+
+
+def test_tail_basis_satisfies_handoff_constraints():
+    J, _ = jac(LinTask(alpha=0.6))
+    rows = LAYOUT["groups"]["eef"]
+    b = fx.tail_basis(J, rows, (2, 4, 6), ND)
+    B = b["shape"]
+    # first-order lag: J_C is a combination of the command sum and the last-step change -> 12, not 18
+    assert b["rank_shape"] == 6 and b["rank_constraints"] == 12
+    np.testing.assert_allclose(B.T @ B, np.eye(6), atol=1e-9)
+    Jr = J[:, rows, :]
+    for M in (fx.sum_operator(C, ND), Jr[C - 1], Jr[C - 1] - Jr[C - 2]):
+        assert np.abs(M @ B).max() < 1e-9 * max(1.0, np.abs(M).max())
+
+
+def test_tail_oer_keeps_the_handoff_where_endpoint_oer_does_not():
+    """Review: endpoint OER preserves the pose at C but not the state; with a lagged controller the
+    deviation appears after C under the SAME continuation. Tail OER also fixes velocity and sum."""
+    task = LinTask(alpha=0.6)
+    J, _ = jac(task)
+    rows = LAYOUT["groups"]["eef"]
+    a0 = np.zeros((C, 7))
+    a0[:, :3] = 0.1
+    cont = np.zeros((C, 7))
+    cont[:, :3] = 0.05
+    snap = task.snapshot()
+    restore = lambda t, s: t.restore(s)  # noqa: E731
+    nom, _ = fx.execute(task, snap, np.concatenate([a0, cont]), restore, measure)
+    v = np.random.default_rng(0).standard_normal(C * ND)
+    drift = {}
+    for name, B in (("endpoint", fx.oer_basis([J], rows, C, (2, 4, 6))["shape"]),
+                    ("tail", fx.tail_basis(J, rows, (2, 4, 6), ND)["shape"])):
+        u = fx.project_direction(B, v)
+        act = a0.copy()
+        act[:, :ND] += 0.05 * np.sqrt(C * ND) * u.reshape(C, ND)
+        st, _ = fx.execute(task, snap, np.concatenate([act, cont]), restore, measure)
+        z = np.array([np.linalg.norm(fx.effect(x, y)[rows]) for x, y in zip(st, nom)])
+        drift[name] = (z[C - 1], z[-1], z[1:C - 1].max())
+    # (rotations are nonlinear at this amplitude: compare with the intermediate deviation, not with 0)
+    for name in ("endpoint", "tail"):
+        assert drift[name][0] < 0.01 * drift[name][2]  # both keep the pose at C
+    assert drift["endpoint"][1] > 0.2 * drift["endpoint"][2]  # endpoint OER drifts after C
+    assert drift["tail"][1] < 0.01 * drift["endpoint"][1]  # tail OER: same state at C -> same future
