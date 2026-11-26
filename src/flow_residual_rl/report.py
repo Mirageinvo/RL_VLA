@@ -264,7 +264,7 @@ def main():
         (out / "table.md").write_text("\n".join(md) + "\n")
     cost = {"cells": {f"t{c['task_id']}_{c['arm']}_s{c['seed']}": c["cost"] for c in cells}}
     for tdir in sorted(runs.glob("*_task*")):
-        for sub in ("bank", "base_eval"):
+        for sub in ("bank", "base_eval", "base_eval_validation", "obs_norm"):
             f = tdir / sub / "cost.json"
             if f.exists():
                 cost[f"{tdir.name}/{sub}"] = json.loads(f.read_text())

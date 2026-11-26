@@ -52,7 +52,7 @@ def n_dims(cfg) -> int:
 
 def basis_for_arm(cfg, arm: str, task_id: int) -> np.ndarray:
     C, nd, r = cfg["execution_horizon"], n_dims(cfg), cfg["rank"]
-    if arm in ("outcome12", "pca12"):
+    if arm in ("outcome12", "pca12", "tail12"):  # tail12: scripts/build_tail_basis.py
         return load_basis(task_dir(cfg, task_id) / "basis" / arm)
     return build_fixed_basis(arm, C, nd, r if not arm.startswith("full") else C * nd, cfg["random_basis_seed"])
 
@@ -73,10 +73,12 @@ def obs_dim(cfg) -> int:
 
 def load_normalizer(cfg, task_id, allow_identity=False) -> ObsNormalizer:
     d = read_json(task_dir(cfg, task_id) / "bank" / "obs_norm.json")
+    if d is None:  # task without a bank: nominal base-GR00T rollouts (stages.fit_nominal_normalizer)
+        d = read_json(task_dir(cfg, task_id) / "obs_norm" / "obs_norm.json")
     if d is None:
         if allow_identity:
             return ObsNormalizer.identity(obs_dim(cfg))
-        raise FileNotFoundError("obs_norm.json missing: collect the bank first (normalisation is fit on its train part)")
+        raise FileNotFoundError("obs_norm.json missing: collect the bank, or fit_nominal_normalizer (run_fixed_pilot.py)")
     return ObsNormalizer.from_dict(d)
 
 

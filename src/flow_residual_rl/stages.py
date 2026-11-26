@@ -16,7 +16,7 @@ from .config import read_json, write_json
 from .envs.chunk_env import ChunkEnv, EpisodeSchedule, ObsNormalizer
 from .evaluate import eval_schedule, run_episodes
 from .outcome_predictor import GroupBatch, train_outcome_basis
-from .pipeline import basis_for_arm, load_normalizer, make_task, residual_map, task_dir, task_splits
+from .pipeline import basis_for_arm, load_normalizer, make_task, obs_dim, residual_map, task_dir, task_splits
 
 
 def log_to(path: Path):
@@ -163,9 +163,14 @@ def eval_env(cfg, task, provider, rmap, norm, eval_ids):
     return ChunkEnv(task, provider, rmap, norm, eval_schedule(eval_ids), bucket="evaluation", settle_bucket="eval_settling")
 
 
-def eval_base(cfg, task_id, provider, task, n_episodes, counter) -> dict:
-    """Base VLA (u=0) on the fixed eval schedule; episodes are cached and reused."""
-    out = task_dir(cfg, task_id) / "base_eval"
+def base_eval_dir(cfg, task_id, split: str = "evaluation") -> Path:
+    return task_dir(cfg, task_id) / ("base_eval" if split == "evaluation" else f"base_eval_{split}")
+
+
+def eval_base(cfg, task_id, provider, task, n_episodes, counter, split: str = "evaluation") -> dict:
+    """Base VLA (u=0) on the fixed schedule of `split` (evaluation: the paired reference of every
+    cell evaluation; validation: task selection); episodes are cached and reused."""
+    out = base_eval_dir(cfg, task_id, split)
     out.mkdir(parents=True, exist_ok=True)
     cache = out / "episodes.jsonl"
     sp = task_splits(cfg, task)
@@ -175,7 +180,7 @@ def eval_base(cfg, task_id, provider, task, n_episodes, counter) -> dict:
                       "base eval: steps of an interrupted (uncached) episode")
     norm = load_normalizer(cfg, task_id, allow_identity=True)
     rmap = residual_map(cfg, basis_for_arm(cfg, "random12", task_id), task)
-    env = eval_env(cfg, task, provider, rmap, norm, sp["evaluation"])
+    env = eval_env(cfg, task, provider, rmap, norm, sp[split])
     provider.counter = counter
     for e in range(len(have), n_episodes):
         obs, _ = env.reset(options={"episode": env.schedule.get(e)})
@@ -189,8 +194,51 @@ def eval_base(cfg, task_id, provider, task, n_episodes, counter) -> dict:
         with open(cache, "a") as f:  # commit point of this episode
             f.write(json.dumps(rec) + "\n")
     recs = have[:n_episodes]
-    return {"n_episodes": len(recs), "success_rate": float(np.mean([r["success"] for r in recs])),
+    return {"split": split, "n_episodes": len(recs), "success_rate": float(np.mean([r["success"] for r in recs])),
             "n_unique_states": len({r["init_state_id"] for r in recs})}
+
+
+def fit_nominal_normalizer(cfg, task_id, provider, n_episodes: int) -> dict:
+    """Observation normaliser for a task WITHOUT an interventions bank: chunk-boundary observations
+    of base-GR00T (u=0) episodes on TRAIN init states. Stored in <task>/obs_norm/ and used by
+    load_normalizer when no bank normaliser exists. Cached; a crashed attempt's steps stay charged."""
+    out = task_dir(cfg, task_id) / "obs_norm"
+    out.mkdir(parents=True, exist_ok=True)
+    done = read_json(out / "obs_norm.json")
+    if done is not None:
+        return done
+    counter = StepCounter(out / "cost.json")
+    provider.counter = counter
+    task = make_task(cfg, task_id, counter, provider)
+    try:
+        sp = task_splits(cfg, task)
+        fpr.check_or_write(out, fpr.base_eval_fp(cfg, task_id, provider, sp), cfg)
+        stale = counter.steps["obs_norm"] + counter.steps["obs_norm_settling"]
+        if stale:
+            counter.move("obs_norm", "aborted", counter.steps["obs_norm"], "crashed obs_norm attempt")
+            counter.move("obs_norm_settling", "aborted", counter.steps["obs_norm_settling"], "crashed obs_norm attempt")
+        ident = ObsNormalizer.identity(obs_dim(cfg))
+        rmap = residual_map(cfg, basis_for_arm(cfg, "random12", task_id), task)
+        env = ChunkEnv(task, provider, rmap, ident, EpisodeSchedule(sp["train"], "obs_norm", cfg["bank_seed"]),
+                       bucket="obs_norm", settle_bucket="obs_norm_settling")
+        X, succ = [], []
+        for e in range(n_episodes):
+            obs, _ = env.reset(options={"episode": env.schedule.get(e)})
+            while True:
+                X.append(obs)
+                obs, _, term, _, info = env.step(np.zeros(rmap.dim, np.float32))
+                if term:
+                    succ.append(bool(info["episode_record"]["success"]))
+                    break
+        norm = ObsNormalizer.fit(np.stack(X))
+        d = dict(norm.to_dict(), fit_on="base GR00T (u=0) chunk-boundary observations, train split",
+                 n=len(X), n_episodes=n_episodes, base_success_rate_train=float(np.mean(succ)), cost=counter.to_dict())
+        counter.save()
+        write_json(out / "obs_norm.json", d)  # commit point
+        return d
+    finally:
+        counter.save()
+        task.close()
 
 
 # ---------------------------------------------------------------- pilot cells
