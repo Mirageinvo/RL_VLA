@@ -345,3 +345,17 @@ def test_tail_oer_keeps_the_handoff_where_endpoint_oer_does_not():
         assert drift[name][0] < 0.01 * drift[name][2]  # both keep the pose at C
     assert drift["endpoint"][1] > 0.2 * drift["endpoint"][2]  # endpoint OER drifts after C
     assert drift["tail"][1] < 0.01 * drift["endpoint"][1]  # tail OER: same state at C -> same future
+
+
+def test_mean_gram_tail_survives_opposite_responses():
+    """Review: a mean J cancels J and -J (rank 0); mean Grams do not."""
+    J, _ = jac(LinTask(alpha=0.6))
+    rows = LAYOUT["groups"]["eef"]
+    b = fx.tail_basis_mean([J, -J], rows, (2, 4, 6), ND)
+    assert b["rank_shape"] == 6
+    assert fx.tail_basis(np.mean([J, -J], axis=0), rows, (2, 4, 6), ND)["rank_shape"] == 0
+    B = b["shape"]
+    np.testing.assert_allclose(B.T @ B, np.eye(6), atol=1e-9)
+    assert np.abs(fx.sum_operator(C, ND) @ B).max() < 1e-9
+    # one anchor: same subspace as the exact local tail basis
+    assert fx.overlap(fx.tail_basis_mean([J], rows, (2, 4, 6), ND)["shape"], fx.tail_basis(J, rows, (2, 4, 6), ND)["shape"]) > 0.999

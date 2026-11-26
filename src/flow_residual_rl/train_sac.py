@@ -69,9 +69,14 @@ def init_actor_heads(model: SAC, log_std_bias: float) -> None:
     # SB3 SAC (use_sde=False) has no separate log_std_init parameter: log_std is a Linear head.
 
 
-def make_sac(env, cfg: dict, seed: int, smoke: bool = False) -> ResidualSAC:
-    if cfg.get("torch_threads"):  # CPU SAC: 32 default threads were ~3x slower per update than 4-8 (profile_sac.py)
+def apply_torch_threads(cfg: dict) -> None:
+    """CPU SAC: 32 default threads were ~3x slower per update than 4-8 (profile_sac.py)."""
+    if cfg.get("torch_threads"):
         torch.set_num_threads(int(cfg["torch_threads"]))
+
+
+def make_sac(env, cfg: dict, seed: int, smoke: bool = False) -> ResidualSAC:
+    apply_torch_threads(cfg)
     d = env.action_space.shape[0]
     model = ResidualSAC(
         "MlpPolicy", env,
@@ -199,6 +204,7 @@ def train_block(cell_dir: Path, env, cfg: dict, seed: int, target_steps: int, sm
         status.setdefault("dropped_uncommitted_episode_records", []).append(dropped)
     gdir = model_dir(cell_dir, status)
     if gdir is not None:
+        apply_torch_threads(cfg)  # a resumed block runs in a new process
         model = ResidualSAC.load(gdir / "model.zip", env=env, device=cfg["sac_device"])
         model.load_replay_buffer(gdir / "replay.pkl")
         fresh = False

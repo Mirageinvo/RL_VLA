@@ -374,6 +374,34 @@ def tail_basis(J, rows, shape_steps, nd: int, k_shape: int = 6, rel_tol: float =
             "rank_shape": r_sh, "n_unmeasured_cols": n_unmeasured}
 
 
+def tail_basis_mean(Js, rows, shape_steps, nd: int, k_suppress: int | None = None, k_shape: int = 6,
+                    rel_tol: float = 1e-8) -> dict:
+    """Fixed tail OER from SEVERAL normalised Jacobians via mean Grams (a mean J would let opposite
+    responses cancel). Exact zero command sum; inside its null space the k_suppress (default 2*nd,
+    the size of one anchor's pose + last-step-change block) leading directions of
+    mean_i A_i^T A_i are suppressed, A_i = [J_C,i / |J_C,i|; (J_C,i - J_C-1,i) / |...|]; shape: the
+    k_shape leading directions of the mean intermediate Gram in what is left."""
+    C, _, N = Js[0].shape
+    k_suppress = 2 * nd if k_suppress is None else k_suppress
+    S = sum_operator(C, nd)
+    Q0 = complement(np.linalg.qr(S.T)[0], N)  # zero-sum directions
+    Gc, Gs = np.zeros((N, N)), np.zeros((N, N))
+    for J in Js:
+        Jr = np.nan_to_num(J[:, rows, :])
+        for a in (Jr[C - 1], Jr[C - 1] - Jr[C - 2]):
+            n = np.linalg.norm(a, 2)
+            if n > 0:
+                Gc += (a / n).T @ (a / n) / len(Js)
+        Gs += sum(Jr[h - 1].T @ Jr[h - 1] for h in shape_steps) / len(Js)
+    w, v = _eig_desc(Q0.T @ Gc @ Q0)
+    r_c = int(min(k_suppress, np.sum(w > rel_tol * max(float(w.max(initial=0)), 1e-300))))
+    Q = Q0 @ complement(v[:, :r_c], Q0.shape[1])
+    ws, vs = _eig_desc(Q.T @ Gs @ Q)
+    r_sh = int(min(k_shape, np.sum(ws > rel_tol * max(float(ws.max(initial=0)), 1e-300))))
+    return {"end": np.hstack([np.linalg.qr(S.T)[0], Q0 @ v[:, :r_c]]), "shape": Q @ vs[:, :r_sh],
+            "ev_suppressed": w[:r_c], "rank_constraints": nd + r_c, "rank_shape": r_sh}
+
+
 def dct_oer(C: int, nd: int) -> dict:
     b = dct_basis(C, nd, 2).astype(np.float64)
     return {"end": b[:, :nd], "shape": b[:, nd:2 * nd], "rank_end": nd, "rank_shape": nd}
